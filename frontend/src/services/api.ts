@@ -1,0 +1,846 @@
+import axios from 'axios'
+import type { AxiosInstance, AxiosError, InternalAxiosRequestConfig } from 'axios'
+import type { APIError } from '../types/index'
+import { normalizeChunkingStrategy } from '../types/index'
+import type {
+  KnowledgeBase,
+  CreateKBRequest,
+  Document,
+  DocumentStatusResponse,
+  PaginatedResponse,
+  ChatRequest,
+  ChatResponse,
+  ConversationSummary,
+  ChatMessageResponse,
+  ConversationDetail,
+  ConversationSettings,
+  ConversationTitleUpdate,
+  EmbeddingModel,
+  AppSettings,
+  AppSettingsUpdate,
+  ApiInfo,
+  SettingsMetadata,
+  LoginRequest,
+  TokenResponse,
+  MeResponse,
+  PromptVersionSummary,
+  PromptVersionDetail,
+  PromptVersionCreate,
+  SelfCheckPromptVersionSummary,
+  SelfCheckPromptVersionDetail,
+  SelfCheckPromptVersionCreate,
+  QASampleUploadResponse,
+  QAEvalRun,
+  QAEvalRunConfig,
+  QAEvalRunDetail,
+  QAGoldCountResponse,
+  FeedbackItem,
+  KBExportRequest,
+  KBImportOptions,
+  KBImportResponse,
+  MCPToken,
+  MCPTokenCreateResponse,
+  MCPRefreshToken,
+  MCPOAuthEvent,
+  OAuthTokenResponse,
+  KBRetrievalSettingsStored,
+  KBRetrievalSettingsEnvelope,
+} from '../types/index'
+
+const ACCESS_TOKEN_KEY = 'kb_access_token'
+const REFRESH_LOCK_KEY = 'kb_refresh_lock'
+const REFRESH_CHANNEL_NAME = 'kb_auth_channel'
+const REFRESH_LOCK_TTL_MS = 15000
+const AUTH_FAILURE_MESSAGE = 'Authentication required'
+export const AUTH_FAILURE_EVENT = 'kb-auth-failure'
+
+class APIClient {
+  private client: AxiosInstance
+  private refreshPromise: Promise<boolean> | null = null
+  private oauthClient: AxiosInstance
+  private refreshChannel: BroadcastChannel | null = null
+  private authFailureInProgress = false
+
+  constructor() {
+    const baseURL = import.meta.env.VITE_API_BASE_URL || ''
+    const prefix = import.meta.env.VITE_API_PREFIX || '/api/v1'
+
+    this.client = axios.create({
+      baseURL: baseURL + prefix,
+      withCredentials: true,
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    })
+
+    this.oauthClient = axios.create({
+      baseURL,
+      withCredentials: true,
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+    })
+
+    if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+      this.refreshChannel = new BroadcastChannel(REFRESH_CHANNEL_NAME)
+      this.refreshChannel.addEventListener('message', (event) => {
+        const data = event.data || {}
+        if (data.type === 'refresh_token' && typeof data.token === 'string') {
+          this.setAccessToken(data.token)
+          this.authFailureInProgress = false
+        }
+      })
+    }
+
+    this.client.interceptors.request.use((config) => {
+      if (this.shouldShortCircuitRequest(config)) {
+        return Promise.reject(new Error(AUTH_FAILURE_MESSAGE))
+      }
+
+      const token = this.getAccessToken()
+      if (token) {
+        config.headers = config.headers || {}
+        config.headers.Authorization = `Bearer ${token}`
+      }
+      return config
+    })
+
+    // Response interceptor for error handling
+    this.client.interceptors.response.use(
+      (response) => response,
+      async (error: AxiosError<APIError>) => {
+        const originalRequest = error.config as (InternalAxiosRequestConfig & { _retry?: boolean }) | undefined
+        const status = error.response?.status
+
+        if (status === 401 && !originalRequest?._retry && !originalRequest?.url?.includes('/auth/')) {
+          if (this.authFailureInProgress) {
+            throw new Error(AUTH_FAILURE_MESSAGE)
+          }
+
+          if (originalRequest) {
+            originalRequest._retry = true
+          }
+
+          try {
+            const refreshed = await this.refreshToken()
+            if (refreshed && originalRequest) {
+              return this.client(originalRequest)
+            }
+          } catch {
+            this.handleAuthFailure()
+          }
+
+          this.handleAuthFailure()
+          throw new Error(AUTH_FAILURE_MESSAGE)
+        }
+
+        if (error.response?.data) {
+          throw new Error(error.response.data.detail || 'An error occurred')
+        }
+        throw error
+      }
+    )
+  }
+
+  private isAuthRequest(config?: Pick<InternalAxiosRequestConfig, 'url'> | null): boolean {
+    return Boolean(config?.url?.includes('/auth/'))
+  }
+
+  private shouldShortCircuitRequest(config: InternalAxiosRequestConfig): boolean {
+    return this.authFailureInProgress && !this.isAuthRequest(config)
+  }
+
+  private getAccessToken(): string | null {
+    try {
+      return localStorage.getItem(ACCESS_TOKEN_KEY)
+    } catch {
+      return null
+    }
+  }
+
+  private setAccessToken(token: string) {
+    try {
+      localStorage.setItem(ACCESS_TOKEN_KEY, token)
+      this.authFailureInProgress = false
+    } catch {
+      // ignore
+    }
+  }
+
+  private clearAccessToken() {
+    try {
+      localStorage.removeItem(ACCESS_TOKEN_KEY)
+    } catch {
+      // ignore
+    }
+  }
+
+  private getRefreshLock(): { owner: string; ts: number } | null {
+    try {
+      const raw = localStorage.getItem(REFRESH_LOCK_KEY)
+      if (!raw) return null
+      const parsed = JSON.parse(raw)
+      if (!parsed || typeof parsed.ts !== 'number' || typeof parsed.owner !== 'string') return null
+      return parsed
+    } catch {
+      return null
+    }
+  }
+
+  private setRefreshLock(owner: string) {
+    try {
+      localStorage.setItem(REFRESH_LOCK_KEY, JSON.stringify({ owner, ts: Date.now() }))
+    } catch {
+      // ignore
+    }
+  }
+
+  private clearRefreshLock(owner: string) {
+    try {
+      const current = this.getRefreshLock()
+      if (!current || current.owner === owner) {
+        localStorage.removeItem(REFRESH_LOCK_KEY)
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  private waitForRefreshSignal(timeoutMs = REFRESH_LOCK_TTL_MS): Promise<boolean> {
+    return new Promise((resolve) => {
+      let done = false
+      const timer = setTimeout(() => {
+        if (done) return
+        done = true
+        resolve(false)
+      }, timeoutMs)
+
+      const onMessage = (event: MessageEvent) => {
+        if (done) return
+        const data = event.data || {}
+        if (data.type === 'refresh_token') {
+          done = true
+          clearTimeout(timer)
+          resolve(true)
+        }
+      }
+
+      if (this.refreshChannel) {
+        this.refreshChannel.addEventListener('message', onMessage, { once: true })
+      } else {
+        const storageListener = (e: StorageEvent) => {
+          if (done) return
+          if (e.key === ACCESS_TOKEN_KEY && e.newValue) {
+            done = true
+            clearTimeout(timer)
+            window.removeEventListener('storage', storageListener)
+            resolve(true)
+          }
+        }
+        window.addEventListener('storage', storageListener)
+      }
+    })
+  }
+
+  private handleAuthFailure() {
+    if (this.authFailureInProgress) {
+      return
+    }
+
+    this.authFailureInProgress = true
+    this.clearAccessToken()
+
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new Event(AUTH_FAILURE_EVENT))
+      const path = window.location?.pathname || ''
+      if (!path.startsWith('/login')) {
+        window.location.replace('/login')
+      }
+    }
+  }
+
+  // Auth
+  async login(payload: LoginRequest): Promise<TokenResponse> {
+    const response = await this.client.post<TokenResponse>('/auth/login', payload)
+    this.setAccessToken(response.data.access_token)
+    return response.data
+  }
+
+  async refreshToken(): Promise<boolean> {
+    if (this.authFailureInProgress) {
+      return false
+    }
+
+    if (this.refreshPromise) {
+      return this.refreshPromise
+    }
+
+    this.refreshPromise = (async () => {
+      const owner = Math.random().toString(36).slice(2)
+      const existing = this.getRefreshLock()
+      if (existing && Date.now() - existing.ts < REFRESH_LOCK_TTL_MS) {
+        const waited = await this.waitForRefreshSignal()
+        if (waited && this.getAccessToken()) {
+          return true
+        }
+      }
+
+      this.setRefreshLock(owner)
+      try {
+        const response = await this.client.post<TokenResponse>('/auth/refresh')
+        this.setAccessToken(response.data.access_token)
+        if (this.refreshChannel) {
+          this.refreshChannel.postMessage({ type: 'refresh_token', token: response.data.access_token })
+        }
+        return true
+      } catch {
+        return false
+      } finally {
+        this.clearRefreshLock(owner)
+        this.refreshPromise = null
+      }
+    })()
+
+    return this.refreshPromise
+  }
+
+  async logout(): Promise<void> {
+    try {
+      await this.client.post('/auth/logout')
+    } finally {
+      this.authFailureInProgress = false
+      this.clearAccessToken()
+    }
+  }
+
+  async me(): Promise<MeResponse> {
+    const response = await this.client.get<MeResponse>('/auth/me')
+    return response.data
+  }
+
+  // Knowledge Bases
+  private normalizeKB(kb: KnowledgeBase): KnowledgeBase {
+    return { ...kb, chunking_strategy: normalizeChunkingStrategy(kb.chunking_strategy) }
+  }
+
+  async getKnowledgeBases(page = 1, pageSize = 10): Promise<PaginatedResponse<KnowledgeBase>> {
+    const response = await this.client.get<PaginatedResponse<KnowledgeBase>>('/knowledge-bases/', {
+      params: { page, page_size: pageSize },
+    })
+    return { ...response.data, items: response.data.items.map((kb) => this.normalizeKB(kb)) }
+  }
+
+  async getDeletedKnowledgeBases(page = 1, pageSize = 10): Promise<PaginatedResponse<KnowledgeBase>> {
+    const response = await this.client.get<PaginatedResponse<KnowledgeBase>>('/knowledge-bases/deleted', {
+      params: { page, page_size: pageSize },
+    })
+    return { ...response.data, items: response.data.items.map((kb) => this.normalizeKB(kb)) }
+  }
+
+  async getKnowledgeBase(id: string): Promise<KnowledgeBase> {
+    const response = await this.client.get<KnowledgeBase>(`/knowledge-bases/${id}`)
+    return this.normalizeKB(response.data)
+  }
+
+  async exportKnowledgeBases(payload: KBExportRequest): Promise<{ blob: Blob; filename: string }> {
+    const response = await this.client.post('/kb/export', payload, { responseType: 'blob' })
+    const disposition = response.headers?.['content-disposition'] || ''
+    const match = disposition.match(/filename="?([^";]+)"?/i)
+    const filename = match?.[1] || 'kb_export.tar.gz'
+    return { blob: response.data as Blob, filename }
+  }
+
+  async exportChatsMarkdown(payload: { kb_ids: string[] }): Promise<{ blob: Blob; filename: string }> {
+    const response = await this.client.post('/kb/export-chats-md', payload, { responseType: 'blob' })
+    const disposition = response.headers?.['content-disposition'] || ''
+    const match = disposition.match(/filename="?([^";]+)"?/i)
+    const filename = match?.[1] || 'kb_chats.zip'
+    return { blob: response.data as Blob, filename }
+  }
+
+  async importKnowledgeBases(file: File, options?: KBImportOptions): Promise<KBImportResponse> {
+    const form = new FormData()
+    form.append('file', file)
+    if (options) {
+      form.append('options', JSON.stringify(options))
+    }
+    const response = await this.client.post<KBImportResponse>('/kb/import', form, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+    return response.data
+  }
+
+  // Prompt Versions
+  async listPromptVersions(): Promise<PromptVersionSummary[]> {
+    const response = await this.client.get<PromptVersionSummary[]>('/prompts/')
+    return response.data
+  }
+
+  async getPromptVersion(id: string): Promise<PromptVersionDetail> {
+    const response = await this.client.get<PromptVersionDetail>(`/prompts/${id}`)
+    return response.data
+  }
+
+  async getActivePromptVersion(): Promise<PromptVersionDetail | null> {
+    const response = await this.client.get<PromptVersionDetail | null>('/prompts/active')
+    return response.data
+  }
+
+  async createPromptVersion(payload: PromptVersionCreate): Promise<PromptVersionDetail> {
+    const response = await this.client.post<PromptVersionDetail>('/prompts/', payload)
+    return response.data
+  }
+
+  async activatePromptVersion(id: string): Promise<PromptVersionDetail> {
+    const response = await this.client.post<PromptVersionDetail>(`/prompts/${id}/activate`)
+    return response.data
+  }
+
+  // Self-Check Prompts
+  async listSelfCheckPromptVersions(): Promise<SelfCheckPromptVersionSummary[]> {
+    const response = await this.client.get<SelfCheckPromptVersionSummary[]>('/prompts/self-check')
+    return response.data
+  }
+
+  async getSelfCheckPromptVersion(id: string): Promise<SelfCheckPromptVersionDetail> {
+    const response = await this.client.get<SelfCheckPromptVersionDetail>(`/prompts/self-check/${id}`)
+    return response.data
+  }
+
+  async getActiveSelfCheckPromptVersion(): Promise<SelfCheckPromptVersionDetail | null> {
+    const response = await this.client.get<SelfCheckPromptVersionDetail | null>('/prompts/self-check/active')
+    return response.data
+  }
+
+  async createSelfCheckPromptVersion(payload: SelfCheckPromptVersionCreate): Promise<SelfCheckPromptVersionDetail> {
+    const response = await this.client.post<SelfCheckPromptVersionDetail>('/prompts/self-check', payload)
+    return response.data
+  }
+
+  async activateSelfCheckPromptVersion(id: string): Promise<SelfCheckPromptVersionDetail> {
+    const response = await this.client.post<SelfCheckPromptVersionDetail>(`/prompts/self-check/${id}/activate`)
+    return response.data
+  }
+
+  async createKnowledgeBase(data: CreateKBRequest): Promise<KnowledgeBase> {
+    const response = await this.client.post<KnowledgeBase>('/knowledge-bases/', data)
+    return this.normalizeKB(response.data)
+  }
+
+  async updateKnowledgeBase(id: string, data: Partial<CreateKBRequest>): Promise<KnowledgeBase> {
+    const response = await this.client.put<KnowledgeBase>(`/knowledge-bases/${id}`, data)
+    return this.normalizeKB(response.data)
+  }
+
+  async getKBRetrievalSettings(id: string): Promise<KBRetrievalSettingsEnvelope> {
+    const response = await this.client.get<KBRetrievalSettingsEnvelope>(`/knowledge-bases/${id}/retrieval-settings`)
+    return response.data
+  }
+
+  async updateKBRetrievalSettings(id: string, data: KBRetrievalSettingsStored): Promise<KBRetrievalSettingsEnvelope> {
+    const response = await this.client.put<KBRetrievalSettingsEnvelope>(`/knowledge-bases/${id}/retrieval-settings`, data)
+    return response.data
+  }
+
+  async clearKBRetrievalSettings(id: string): Promise<KBRetrievalSettingsEnvelope> {
+    const response = await this.client.delete<KBRetrievalSettingsEnvelope>(`/knowledge-bases/${id}/retrieval-settings`)
+    return response.data
+  }
+
+  async deleteKnowledgeBase(id: string): Promise<void> {
+    await this.client.delete(`/knowledge-bases/${id}`)
+  }
+
+  async restoreKnowledgeBase(id: string): Promise<{ restored: boolean; queued: number; knowledge_base_id: string }> {
+    const response = await this.client.post<{ restored: boolean; queued: number; knowledge_base_id: string }>(
+      `/knowledge-bases/${id}/restore`
+    )
+    return response.data
+  }
+
+  async purgeKnowledgeBase(id: string): Promise<void> {
+    await this.client.delete(`/knowledge-bases/${id}/purge`)
+  }
+
+  async reprocessKnowledgeBase(
+    id: string,
+    detectDuplicates = false,
+    contextualDescriptionEnabled: boolean | null = null
+  ): Promise<{ queued: number; knowledge_base_id: string }> {
+    const params: Record<string, unknown> = { detect_duplicates: detectDuplicates }
+    if (contextualDescriptionEnabled !== null) {
+      params.contextual_description_enabled = contextualDescriptionEnabled
+    }
+    const response = await this.client.post<{ queued: number; knowledge_base_id: string }>(
+      `/knowledge-bases/${id}/reprocess`,
+      null,
+      { params }
+    )
+    return response.data
+  }
+
+  // QA Auto-Tuning (Gold)
+  async uploadGoldQA(
+    kbId: string,
+    file: File,
+    replaceExisting = true
+  ): Promise<QASampleUploadResponse> {
+    const formData = new FormData()
+    formData.append('file', file)
+    const response = await this.client.post<QASampleUploadResponse>(
+      `/knowledge-bases/${kbId}/auto-tune/gold/upload`,
+      formData,
+      {
+        params: { replace_existing: replaceExisting },
+        headers: { 'Content-Type': 'multipart/form-data' },
+      }
+    )
+    return response.data
+  }
+
+  async getGoldQACount(kbId: string): Promise<QAGoldCountResponse> {
+    const response = await this.client.get<QAGoldCountResponse>(`/knowledge-bases/${kbId}/auto-tune/gold/count`)
+    return response.data
+  }
+
+  async runGoldEval(kbId: string, payload: QAEvalRunConfig): Promise<QAEvalRun> {
+    const response = await this.client.post<QAEvalRun>(`/knowledge-bases/${kbId}/auto-tune/gold/run`, payload)
+    return response.data
+  }
+
+  async listAutoTuneRuns(kbId: string, limit = 20): Promise<QAEvalRun[]> {
+    const response = await this.client.get<QAEvalRun[]>(`/knowledge-bases/${kbId}/auto-tune/runs`, {
+      params: { limit },
+    })
+    return response.data
+  }
+
+  async getAutoTuneRun(kbId: string, runId: string): Promise<QAEvalRunDetail> {
+    const response = await this.client.get<QAEvalRunDetail>(`/knowledge-bases/${kbId}/auto-tune/runs/${runId}`)
+    return response.data
+  }
+
+  async deleteAutoTuneRun(kbId: string, runId: string): Promise<void> {
+    await this.client.delete(`/knowledge-bases/${kbId}/auto-tune/runs/${runId}`)
+  }
+
+  async deleteAllAutoTuneRuns(kbId: string): Promise<void> {
+    await this.client.delete(`/knowledge-bases/${kbId}/auto-tune/runs`)
+  }
+
+  // Documents
+  async getDocuments(kbId: string, page = 1, pageSize = 20): Promise<PaginatedResponse<Document>> {
+    const response = await this.client.get<PaginatedResponse<Document>>('/documents/', {
+      params: { knowledge_base_id: kbId, page, page_size: pageSize },
+    })
+    return response.data
+  }
+
+  async getDocument(id: string): Promise<Document> {
+    const response = await this.client.get<Document>(`/documents/${id}`)
+    return response.data
+  }
+
+  async getDocumentStatus(id: string): Promise<DocumentStatusResponse> {
+    const response = await this.client.get<DocumentStatusResponse>(`/documents/${id}/status`)
+    return response.data
+  }
+
+  async uploadDocument(
+    kbId: string,
+    file: File,
+    detectDuplicates = false,
+    contextualDescriptionEnabled: boolean | null = null
+  ): Promise<Document> {
+    const formData = new FormData()
+    formData.append('file', file)
+    formData.append('knowledge_base_id', kbId)
+    formData.append('detect_duplicates', String(detectDuplicates))
+    if (contextualDescriptionEnabled !== null) {
+      formData.append('contextual_description_enabled', String(contextualDescriptionEnabled))
+    }
+
+    const response = await this.client.post<Document>('/documents/', formData, {
+      headers: {
+        'Content-Type': 'multipart/form-data',
+      },
+    })
+    return response.data
+  }
+
+  async previewDocumentFromUrl(url: string): Promise<import('../types').UrlPreview> {
+    const response = await this.client.post('/documents/from-url/preview', { url })
+    return response.data
+  }
+
+  async importDocumentFromUrl(
+    kbId: string,
+    url: string,
+    detectDuplicates = false,
+    contextualDescriptionEnabled: boolean | null = null
+  ): Promise<Document> {
+    const body: Record<string, unknown> = {
+      knowledge_base_id: kbId,
+      url,
+      detect_duplicates: detectDuplicates,
+    }
+    if (contextualDescriptionEnabled !== null) {
+      body.contextual_description_enabled = contextualDescriptionEnabled
+    }
+    const response = await this.client.post<Document>('/documents/from-url', body)
+    return response.data
+  }
+
+  async reprocessDocument(
+    id: string,
+    detectDuplicates = false,
+    contextualDescriptionEnabled: boolean | null = null
+  ): Promise<Document> {
+    const params: Record<string, unknown> = { detect_duplicates: detectDuplicates }
+    if (contextualDescriptionEnabled !== null) {
+      params.contextual_description_enabled = contextualDescriptionEnabled
+    }
+    const response = await this.client.post<Document>(`/documents/${id}/reprocess`, null, {
+      params,
+    })
+    return response.data
+  }
+
+  async recomputeDocumentDuplicates(id: string): Promise<{ total_groups: number; total_chunks: number; groups: Array<{ hash: string; chunks: number[]; count: number }> }> {
+    const response = await this.client.post(`/documents/${id}/duplicates/recompute`)
+    return response.data
+  }
+
+  async deleteDocument(id: string): Promise<void> {
+    await this.client.delete(`/documents/${id}`)
+  }
+
+  async downloadDocument(id: string, fallbackFilename: string): Promise<{ blob: Blob; filename: string }> {
+    const response = await this.client.get(`/documents/${id}/download`, { responseType: 'blob' })
+    const disposition = response.headers?.['content-disposition'] || ''
+    const match = disposition.match(/filename="?([^";]+)"?/i)
+    const filename = match?.[1] || fallbackFilename
+    return { blob: response.data as Blob, filename }
+  }
+
+  // Chat
+  async chat(data: ChatRequest): Promise<ChatResponse> {
+    const response = await this.client.post<ChatResponse>('/chat/', data)
+    return response.data
+  }
+
+  async listConversations(knowledgeBaseId: string): Promise<ConversationSummary[]> {
+    const response = await this.client.get<ConversationSummary[]>('/chat/conversations', {
+      params: { knowledge_base_id: knowledgeBaseId },
+    })
+    return response.data
+  }
+
+  async getConversationMessages(conversationId: string): Promise<ChatMessageResponse[]> {
+    const response = await this.client.get<ChatMessageResponse[]>(
+      `/chat/conversations/${conversationId}/messages`
+    )
+    return response.data
+  }
+
+  async rateMessage(
+    conversationId: string,
+    messageId: string,
+    rating: -1 | 0 | 1,
+    comment?: string | null
+  ): Promise<ChatMessageResponse> {
+    const response = await this.client.put<ChatMessageResponse>(
+      `/chat/conversations/${conversationId}/messages/${messageId}/rating`,
+      { rating, comment: comment ?? null }
+    )
+    return response.data
+  }
+
+  async listKbFeedback(
+    kbId: string,
+    rating?: -1 | 0 | 1,
+    limit = 100
+  ): Promise<FeedbackItem[]> {
+    const params = new URLSearchParams()
+    if (rating !== undefined) params.set('rating', String(rating))
+    params.set('limit', String(limit))
+    const qs = params.toString()
+    const response = await this.client.get<FeedbackItem[]>(
+      `/chat/knowledge-bases/${kbId}/feedback${qs ? '?' + qs : ''}`
+    )
+    return response.data
+  }
+
+  async getConversation(conversationId: string): Promise<ConversationDetail> {
+    const response = await this.client.get<ConversationDetail>(
+      `/chat/conversations/${conversationId}`
+    )
+    return response.data
+  }
+
+  async updateConversationSettings(
+    conversationId: string,
+    settings: ConversationSettings
+  ): Promise<ConversationDetail> {
+    const response = await this.client.patch<ConversationDetail>(
+      `/chat/conversations/${conversationId}/settings`,
+      settings
+    )
+    return response.data
+  }
+
+  async updateConversationTitle(
+    conversationId: string,
+    payload: ConversationTitleUpdate
+  ): Promise<ConversationDetail> {
+    const response = await this.client.patch<ConversationDetail>(
+      `/chat/conversations/${conversationId}`,
+      payload
+    )
+    return response.data
+  }
+
+  async deleteConversation(conversationId: string): Promise<{ status: string; id: string }> {
+    const response = await this.client.delete(`/chat/conversations/${conversationId}`)
+    return response.data
+  }
+
+  async deleteConversationMessage(
+    conversationId: string,
+    messageId: string,
+    pair = true
+  ): Promise<{ status: string; deleted_ids: string[] }> {
+    const response = await this.client.delete(
+      `/chat/conversations/${conversationId}/messages/${messageId}`,
+      { params: { pair } }
+    )
+    return response.data
+  }
+
+  async regenerateChatTitles(
+    knowledgeBaseId: string,
+    includeExisting = false,
+    limit?: number
+  ): Promise<{ updated: number; skipped: number; total: number }> {
+    const response = await this.client.post(
+      `/knowledge_bases/${knowledgeBaseId}/regenerate_chat_titles`,
+      { include_existing: includeExisting, limit }
+    )
+    return response.data
+  }
+
+  // Embedding Models
+  async getEmbeddingModels(): Promise<EmbeddingModel[]> {
+    const response = await this.client.get<EmbeddingModel[]>('/embeddings/models')
+    return response.data
+  }
+
+  async getEmbeddingModel(modelName: string): Promise<EmbeddingModel> {
+    const response = await this.client.get<EmbeddingModel>(`/embeddings/models/${modelName}`)
+    return response.data
+  }
+
+  // LLM Models
+  async getLLMModels(): Promise<{ models: any[]; providers: any; total: number }> {
+    const response = await this.client.get('/llm/models')
+    return response.data
+  }
+
+  // App Settings
+  async getAppSettings(): Promise<AppSettings> {
+    const response = await this.client.get<AppSettings>('/settings')
+    return response.data
+  }
+
+  async updateAppSettings(payload: AppSettingsUpdate): Promise<AppSettings> {
+    const response = await this.client.put<AppSettings>('/settings', payload)
+    return response.data
+  }
+
+  async getSettingsMetadata(): Promise<SettingsMetadata> {
+    const response = await this.client.get<SettingsMetadata>('/settings/metadata')
+    return response.data
+  }
+
+  // System Settings (API keys, database URLs, etc.)
+  async getSystemSettings(): Promise<any> {
+    const response = await this.client.get('/system-settings')
+    return response.data
+  }
+
+  async updateSystemSettings(payload: any): Promise<any> {
+    const response = await this.client.put('/system-settings', payload)
+    return response.data
+  }
+
+  async testProviderKey(payload: { provider: string; api_key?: string | null; base_url?: string | null }): Promise<any> {
+    const response = await this.client.post('/system-settings/test-provider', payload)
+    return response.data
+  }
+
+  async listMcpTokens(): Promise<MCPToken[]> {
+    const response = await this.client.get<MCPToken[]>('/mcp-tokens/')
+    return response.data
+  }
+
+  async createMcpToken(payload: { name?: string; expires_in_days?: number | null }): Promise<MCPTokenCreateResponse> {
+    const response = await this.client.post<MCPTokenCreateResponse>('/mcp-tokens/', payload)
+    return response.data
+  }
+
+  async listMcpRefreshTokens(): Promise<MCPRefreshToken[]> {
+    const response = await this.client.get<MCPRefreshToken[]>('/mcp-refresh-tokens/')
+    return response.data
+  }
+
+  async listMcpOAuthEvents(limit = 20): Promise<MCPOAuthEvent[]> {
+    const response = await this.client.get<MCPOAuthEvent[]>('/mcp-oauth-events/', {
+      params: { limit }
+    })
+    return response.data
+  }
+
+  async revokeMcpRefreshToken(jti: string): Promise<void> {
+    await this.client.delete(`/mcp-refresh-tokens/${jti}`)
+  }
+
+  async createMcpOAuthToken(payload: { username: string; password: string }): Promise<OAuthTokenResponse> {
+    const params = new URLSearchParams()
+    params.set('grant_type', 'password')
+    params.set('username', payload.username)
+    params.set('password', payload.password)
+
+    const response = await this.oauthClient.post<OAuthTokenResponse>('/oauth/token', params)
+    return response.data
+  }
+
+  async revokeMcpToken(tokenId: string): Promise<{ status: string; token_id: string }> {
+    const response = await this.client.delete<{ status: string; token_id: string }>(`/mcp-tokens/${tokenId}`)
+    return response.data
+  }
+
+  async deleteMcpToken(tokenId: string): Promise<{ status: string; token_id: string }> {
+    const response = await this.client.delete<{ status: string; token_id: string }>(`/mcp-tokens/${tokenId}/purge`)
+    return response.data
+  }
+
+  async changePostgresPassword(username: string, newPassword: string): Promise<any> {
+    const response = await this.client.post('/system-settings/postgres-password', {
+      username,
+      new_password: newPassword
+    })
+    return response.data
+  }
+
+  async resetAppSettings(): Promise<AppSettings> {
+    const response = await this.client.post<AppSettings>('/settings/reset')
+    return response.data
+  }
+
+  async getApiInfo(): Promise<ApiInfo> {
+    const response = await this.client.get<ApiInfo>('/info')
+    return response.data
+  }
+}
+
+export const apiClient = new APIClient()

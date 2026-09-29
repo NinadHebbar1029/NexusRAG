@@ -1,0 +1,717 @@
+"""System settings endpoints (API keys, database URLs, etc.)."""
+
+import logging
+from typing import Optional
+
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.system_settings import SystemSettingsManager
+from app.db.session import get_db
+from app.services.setup_manager import SetupManager
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+
+def _coerce_bool(value: Optional[str]) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _coerce_list(value: Optional[str]) -> Optional[list[str]]:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return []
+        if value.startswith("["):
+            import json
+
+            try:
+                return json.loads(value)
+            except Exception as exc:
+                logger.warning("Malformed JSON list setting, returning empty: %s", exc)
+                return []
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return None
+
+
+class SystemSettingsResponse(BaseModel):
+    """Response with system settings (sensitive values masked)."""
+
+    # API Keys (masked)
+    openai_api_key: Optional[str] = Field(None, description="OpenAI API key (masked)")
+    voyage_api_key: Optional[str] = Field(None, description="VoyageAI API key (masked)")
+    cohere_api_key: Optional[str] = Field(None, description="Cohere API key (masked)")
+    anthropic_api_key: Optional[str] = Field(None, description="Anthropic API key (masked)")
+    deepseek_api_key: Optional[str] = Field(None, description="DeepSeek API key (masked)")
+    ollama_base_url: Optional[str] = Field(None, description="Ollama API base URL")
+    mcp_enabled: Optional[bool] = Field(None, description="Enable MCP endpoint")
+    mcp_path: Optional[str] = Field(None, description="MCP endpoint path")
+    mcp_public_base_url: Optional[str] = Field(None, description="Public base URL for MCP")
+    mcp_default_kb_id: Optional[str] = Field(None, description="Default KB for MCP tools")
+    mcp_tools_enabled: Optional[list[str]] = Field(None, description="Enabled MCP tools")
+    mcp_auth_mode: Optional[str] = Field(
+        None, description="MCP auth mode (bearer | refresh | oauth2)"
+    )
+    mcp_access_token_ttl_minutes: Optional[int] = Field(
+        None, description="MCP OAuth access token TTL (minutes)"
+    )
+    mcp_refresh_token_ttl_days: Optional[int] = Field(
+        None, description="MCP OAuth refresh token TTL (days)"
+    )
+    mcp_oauth_allowed_redirect_uris: Optional[list[str]] = Field(
+        None, description="Allowed OAuth redirect URIs"
+    )
+    mcp_oauth_allowed_client_ids: Optional[list[str]] = Field(
+        None, description="Allowed OAuth client IDs"
+    )
+
+    # Database URLs
+    qdrant_url: Optional[str] = Field(None, description="Qdrant URL")
+    qdrant_api_key: Optional[str] = Field(None, description="Qdrant API key (masked)")
+    opensearch_url: Optional[str] = Field(None, description="OpenSearch URL")
+    opensearch_username: Optional[str] = Field(None, description="OpenSearch username")
+    opensearch_password: Optional[str] = Field(None, description="OpenSearch password (masked)")
+
+    # System
+    system_name: Optional[str] = Field(None, description="System name")
+    max_file_size_mb: Optional[int] = Field(None, description="Max file size in MB")
+
+
+class SystemSettingsUpdate(BaseModel):
+    """Update system settings."""
+
+    # API Keys
+    openai_api_key: Optional[str] = Field(None, description="OpenAI API key")
+    voyage_api_key: Optional[str] = Field(None, description="VoyageAI API key")
+    cohere_api_key: Optional[str] = Field(None, description="Cohere API key")
+    anthropic_api_key: Optional[str] = Field(None, description="Anthropic API key")
+    deepseek_api_key: Optional[str] = Field(None, description="DeepSeek API key")
+    ollama_base_url: Optional[str] = Field(None, description="Ollama API base URL")
+    mcp_enabled: Optional[bool] = Field(None, description="Enable MCP endpoint")
+    mcp_path: Optional[str] = Field(None, description="MCP endpoint path")
+    mcp_public_base_url: Optional[str] = Field(None, description="Public base URL for MCP")
+    mcp_default_kb_id: Optional[str] = Field(None, description="Default KB for MCP tools")
+    mcp_tools_enabled: Optional[list[str]] = Field(None, description="Enabled MCP tools")
+    mcp_auth_mode: Optional[str] = Field(
+        None, description="MCP auth mode (bearer | refresh | oauth2)"
+    )
+    mcp_access_token_ttl_minutes: Optional[int] = Field(
+        None, description="MCP OAuth access token TTL (minutes)"
+    )
+    mcp_refresh_token_ttl_days: Optional[int] = Field(
+        None, description="MCP OAuth refresh token TTL (days)"
+    )
+    mcp_oauth_allowed_redirect_uris: Optional[list[str]] = Field(
+        None, description="Allowed OAuth redirect URIs"
+    )
+    mcp_oauth_allowed_client_ids: Optional[list[str]] = Field(
+        None, description="Allowed OAuth client IDs"
+    )
+
+    # Database URLs
+    qdrant_url: Optional[str] = Field(None, description="Qdrant URL")
+    qdrant_api_key: Optional[str] = Field(None, description="Qdrant API key")
+    opensearch_url: Optional[str] = Field(None, description="OpenSearch URL")
+    opensearch_username: Optional[str] = Field(None, description="OpenSearch username")
+    opensearch_password: Optional[str] = Field(None, description="OpenSearch password")
+
+    # System
+    system_name: Optional[str] = Field(None, description="System name")
+    max_file_size_mb: Optional[int] = Field(None, description="Max file size in MB")
+
+
+class PostgresPasswordUpdate(BaseModel):
+    """Update PostgreSQL password."""
+
+    username: str = Field(..., description="PostgreSQL username")
+    new_password: str = Field(..., min_length=8, description="New password (min 8 characters)")
+
+
+class ProviderTestRequest(BaseModel):
+    """Test connectivity for a provider API key/base URL."""
+
+    provider: str = Field(
+        ..., description="Provider name: openai|anthropic|cohere|deepseek|voyage|ollama"
+    )
+    api_key: Optional[str] = Field(
+        None, description="API key to test (optional, uses stored key if omitted)"
+    )
+    base_url: Optional[str] = Field(
+        None, description="Base URL override for providers that support it"
+    )
+
+
+class ProviderTestResponse(BaseModel):
+    """Result of provider connectivity test."""
+
+    provider: str
+    success: bool
+    status_code: int
+    message: str
+
+
+def _mask_sensitive(value: Optional[str], show_chars: int = 4) -> Optional[str]:
+    """Mask sensitive value, showing only last N characters."""
+    if not value:
+        return None
+    if len(value) <= show_chars:
+        return "*" * len(value)
+    return "*" * (len(value) - show_chars) + value[-show_chars:]
+
+
+def _is_masked(value: Optional[str]) -> bool:
+    if not value:
+        return False
+    return "*" in value
+
+
+async def _resolve_provider_key(
+    db: AsyncSession, provider: str, api_key: Optional[str]
+) -> Optional[str]:
+    if api_key and not _is_masked(api_key):
+        return api_key.strip()
+
+    key_map = {
+        "openai": "openai_api_key",
+        "anthropic": "anthropic_api_key",
+        "cohere": "cohere_api_key",
+        "deepseek": "deepseek_api_key",
+        "voyage": "voyage_api_key",
+    }
+    db_key = key_map.get(provider)
+    if not db_key:
+        return None
+    return await SystemSettingsManager.get_setting(db, db_key)
+
+
+@router.get("/", response_model=SystemSettingsResponse)
+async def get_system_settings(db: AsyncSession = Depends(get_db)):
+    """
+    Get system settings (API keys, database URLs, etc.).
+
+    Sensitive values are masked for security.
+    """
+    try:
+        # Load all settings from database
+        settings_dict = await SystemSettingsManager.load_from_db(db)
+
+        # Mask sensitive values
+        return SystemSettingsResponse(
+            openai_api_key=_mask_sensitive(settings_dict.get("openai_api_key")),
+            voyage_api_key=_mask_sensitive(settings_dict.get("voyage_api_key")),
+            cohere_api_key=_mask_sensitive(settings_dict.get("cohere_api_key")),
+            anthropic_api_key=_mask_sensitive(settings_dict.get("anthropic_api_key")),
+            deepseek_api_key=_mask_sensitive(settings_dict.get("deepseek_api_key")),
+            ollama_base_url=settings_dict.get("ollama_base_url"),  # Not sensitive
+            mcp_enabled=_coerce_bool(settings_dict.get("mcp_enabled")),
+            mcp_path=settings_dict.get("mcp_path"),
+            mcp_public_base_url=settings_dict.get("mcp_public_base_url"),
+            mcp_default_kb_id=settings_dict.get("mcp_default_kb_id"),
+            mcp_tools_enabled=_coerce_list(settings_dict.get("mcp_tools_enabled")),
+            mcp_auth_mode=settings_dict.get("mcp_auth_mode"),
+            mcp_access_token_ttl_minutes=(
+                int(settings_dict.get("mcp_access_token_ttl_minutes"))
+                if settings_dict.get("mcp_access_token_ttl_minutes") is not None
+                else None
+            ),
+            mcp_refresh_token_ttl_days=(
+                int(settings_dict.get("mcp_refresh_token_ttl_days"))
+                if settings_dict.get("mcp_refresh_token_ttl_days") is not None
+                else None
+            ),
+            mcp_oauth_allowed_redirect_uris=_coerce_list(
+                settings_dict.get("mcp_oauth_allowed_redirect_uris")
+            ),
+            mcp_oauth_allowed_client_ids=_coerce_list(
+                settings_dict.get("mcp_oauth_allowed_client_ids")
+            ),
+            qdrant_url=settings_dict.get("qdrant_url"),
+            qdrant_api_key=_mask_sensitive(settings_dict.get("qdrant_api_key")),
+            opensearch_url=settings_dict.get("opensearch_url"),
+            opensearch_username=settings_dict.get("opensearch_username"),
+            opensearch_password=_mask_sensitive(settings_dict.get("opensearch_password")),
+            system_name=settings_dict.get("system_name"),
+            max_file_size_mb=(
+                int(settings_dict.get("max_file_size_mb", 50))
+                if settings_dict.get("max_file_size_mb")
+                else None
+            ),
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to get system settings: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get system settings",
+        )
+
+
+@router.put("/", response_model=dict)
+async def update_system_settings(
+    payload: SystemSettingsUpdate,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Update system settings (API keys, database URLs, etc.).
+
+    Only provided fields will be updated.
+    """
+    try:
+        updated_count = 0
+        mcp_updated = False
+
+        # Update API keys
+        if payload.openai_api_key is not None:
+            await SystemSettingsManager.save_setting(
+                db=db,
+                key="openai_api_key",
+                value=payload.openai_api_key,
+                category="api",
+                description="OpenAI API key",
+                is_encrypted=False,
+            )
+            updated_count += 1
+
+        if payload.voyage_api_key is not None:
+            await SystemSettingsManager.save_setting(
+                db=db,
+                key="voyage_api_key",
+                value=payload.voyage_api_key,
+                category="api",
+                description="VoyageAI API key",
+                is_encrypted=False,
+            )
+            updated_count += 1
+
+        if payload.cohere_api_key is not None:
+            await SystemSettingsManager.save_setting(
+                db=db,
+                key="cohere_api_key",
+                value=payload.cohere_api_key,
+                category="api",
+                description="Cohere API key",
+                is_encrypted=False,
+            )
+            updated_count += 1
+
+        if payload.anthropic_api_key is not None:
+            await SystemSettingsManager.save_setting(
+                db=db,
+                key="anthropic_api_key",
+                value=payload.anthropic_api_key,
+                category="api",
+                description="Anthropic API key",
+                is_encrypted=False,
+            )
+            updated_count += 1
+
+        if payload.deepseek_api_key is not None:
+            await SystemSettingsManager.save_setting(
+                db=db,
+                key="deepseek_api_key",
+                value=payload.deepseek_api_key,
+                category="api",
+                description="DeepSeek API key",
+                is_encrypted=False,
+            )
+            updated_count += 1
+
+        if payload.ollama_base_url is not None:
+            await SystemSettingsManager.save_setting(
+                db=db,
+                key="ollama_base_url",
+                value=payload.ollama_base_url,
+                category="api",
+                description="Ollama API base URL",
+                is_encrypted=False,
+            )
+            updated_count += 1
+
+        if payload.mcp_enabled is not None:
+            await SystemSettingsManager.save_setting(
+                db=db,
+                key="mcp_enabled",
+                value=str(payload.mcp_enabled).lower(),
+                category="mcp",
+                description="Enable MCP endpoint",
+                is_encrypted=False,
+            )
+            updated_count += 1
+            mcp_updated = True
+
+        if payload.mcp_path is not None:
+            await SystemSettingsManager.save_setting(
+                db=db,
+                key="mcp_path",
+                value=payload.mcp_path,
+                category="mcp",
+                description="MCP endpoint path",
+                is_encrypted=False,
+            )
+            updated_count += 1
+            mcp_updated = True
+
+        if payload.mcp_public_base_url is not None:
+            await SystemSettingsManager.save_setting(
+                db=db,
+                key="mcp_public_base_url",
+                value=payload.mcp_public_base_url,
+                category="mcp",
+                description="Public base URL for MCP endpoints",
+                is_encrypted=False,
+            )
+            updated_count += 1
+            mcp_updated = True
+
+        if payload.mcp_default_kb_id is not None:
+            await SystemSettingsManager.save_setting(
+                db=db,
+                key="mcp_default_kb_id",
+                value=payload.mcp_default_kb_id,
+                category="mcp",
+                description="Default KB for MCP tools",
+                is_encrypted=False,
+            )
+            updated_count += 1
+            mcp_updated = True
+
+        if payload.mcp_tools_enabled is not None:
+            import json
+
+            await SystemSettingsManager.save_setting(
+                db=db,
+                key="mcp_tools_enabled",
+                value=json.dumps(payload.mcp_tools_enabled),
+                category="mcp",
+                description="Enabled MCP tools",
+                is_encrypted=False,
+            )
+            updated_count += 1
+            mcp_updated = True
+
+        if payload.mcp_auth_mode is not None:
+            await SystemSettingsManager.save_setting(
+                db=db,
+                key="mcp_auth_mode",
+                value=payload.mcp_auth_mode,
+                category="mcp",
+                description="MCP auth mode (bearer | refresh | oauth2)",
+                is_encrypted=False,
+            )
+            updated_count += 1
+            mcp_updated = True
+
+        if payload.mcp_access_token_ttl_minutes is not None:
+            await SystemSettingsManager.save_setting(
+                db=db,
+                key="mcp_access_token_ttl_minutes",
+                value=str(payload.mcp_access_token_ttl_minutes),
+                category="mcp",
+                description="MCP OAuth access token TTL (minutes)",
+                is_encrypted=False,
+            )
+            updated_count += 1
+            mcp_updated = True
+
+        if payload.mcp_refresh_token_ttl_days is not None:
+            await SystemSettingsManager.save_setting(
+                db=db,
+                key="mcp_refresh_token_ttl_days",
+                value=str(payload.mcp_refresh_token_ttl_days),
+                category="mcp",
+                description="MCP OAuth refresh token TTL (days)",
+                is_encrypted=False,
+            )
+            updated_count += 1
+            mcp_updated = True
+
+        if payload.mcp_oauth_allowed_redirect_uris is not None:
+            import json
+
+            await SystemSettingsManager.save_setting(
+                db=db,
+                key="mcp_oauth_allowed_redirect_uris",
+                value=json.dumps(payload.mcp_oauth_allowed_redirect_uris),
+                category="mcp",
+                description="Allowed OAuth redirect URIs",
+                is_encrypted=False,
+            )
+            updated_count += 1
+            mcp_updated = True
+
+        if payload.mcp_oauth_allowed_client_ids is not None:
+            import json
+
+            await SystemSettingsManager.save_setting(
+                db=db,
+                key="mcp_oauth_allowed_client_ids",
+                value=json.dumps(payload.mcp_oauth_allowed_client_ids),
+                category="mcp",
+                description="Allowed OAuth client IDs",
+                is_encrypted=False,
+            )
+            updated_count += 1
+            mcp_updated = True
+
+        # Update database URLs
+        if payload.qdrant_url is not None:
+            await SystemSettingsManager.save_setting(
+                db=db,
+                key="qdrant_url",
+                value=payload.qdrant_url,
+                category="database",
+                description="Qdrant URL",
+                is_encrypted=False,
+            )
+            updated_count += 1
+
+        if payload.qdrant_api_key is not None:
+            await SystemSettingsManager.save_setting(
+                db=db,
+                key="qdrant_api_key",
+                value=payload.qdrant_api_key,
+                category="database",
+                description="Qdrant API key",
+                is_encrypted=False,
+            )
+            updated_count += 1
+
+        if payload.opensearch_url is not None:
+            await SystemSettingsManager.save_setting(
+                db=db,
+                key="opensearch_url",
+                value=payload.opensearch_url,
+                category="database",
+                description="OpenSearch URL",
+                is_encrypted=False,
+            )
+            updated_count += 1
+
+        if payload.opensearch_username is not None:
+            await SystemSettingsManager.save_setting(
+                db=db,
+                key="opensearch_username",
+                value=payload.opensearch_username,
+                category="database",
+                description="OpenSearch username",
+                is_encrypted=False,
+            )
+            updated_count += 1
+
+        if payload.opensearch_password is not None:
+            await SystemSettingsManager.save_setting(
+                db=db,
+                key="opensearch_password",
+                value=payload.opensearch_password,
+                category="database",
+                description="OpenSearch password",
+                is_encrypted=False,
+            )
+            updated_count += 1
+
+        # Update system settings
+        if payload.system_name is not None:
+            await SystemSettingsManager.save_setting(
+                db=db,
+                key="system_name",
+                value=payload.system_name,
+                category="system",
+                description="System name",
+                is_encrypted=False,
+            )
+            updated_count += 1
+
+        if payload.max_file_size_mb is not None:
+            await SystemSettingsManager.save_setting(
+                db=db,
+                key="max_file_size_mb",
+                value=str(payload.max_file_size_mb),
+                category="limits",
+                description="Maximum file size in MB",
+                is_encrypted=False,
+            )
+            updated_count += 1
+
+        await db.commit()
+
+        # Reload settings from database to apply changes
+        from app.config import load_settings_from_db
+
+        await load_settings_from_db()
+
+        # Ensure cached LLM services pick up new settings (e.g., API keys)
+        try:
+            from app.services.rag import close_rag_service
+
+            await close_rag_service()
+        except Exception as exc:
+            logger.warning("Failed to close cached RAG service after settings update: %s", exc)
+
+        if mcp_updated:
+            try:
+                from app.mcp.manager import reload_mcp_routes
+
+                if request is None:
+                    logger.warning(
+                        "MCP settings updated but request is unavailable; skipping reload."
+                    )
+                else:
+                    await reload_mcp_routes(request.app)
+            except Exception as exc:
+                logger.warning("Failed to reload MCP routes: %s", exc)
+
+        logger.info(f"Updated {updated_count} system settings")
+
+        return {
+            "success": True,
+            "message": f"Updated {updated_count} settings successfully",
+            "updated_count": updated_count,
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to update system settings: {e}")
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update system settings",
+        )
+
+
+@router.post("/postgres-password", response_model=dict)
+async def change_postgres_password(
+    payload: PostgresPasswordUpdate, db: AsyncSession = Depends(get_db)
+):
+    """
+    Change PostgreSQL password.
+
+    This will:
+    1. Change password in PostgreSQL
+    2. Recreate connection pool with new credentials
+    """
+    try:
+        result = await SetupManager.change_postgres_password(
+            db=db,
+            username=payload.username,
+            new_password=payload.new_password,
+        )
+
+        return {
+            "success": True,
+            "message": "PostgreSQL password changed successfully",
+            "username": result["username"],
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to change PostgreSQL password: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to change PostgreSQL password",
+        )
+
+
+@router.post("/test-provider", response_model=ProviderTestResponse)
+async def test_provider_key(
+    payload: ProviderTestRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    provider = (payload.provider or "").strip().lower()
+    if provider not in {"openai", "anthropic", "cohere", "deepseek", "voyage", "ollama"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported provider")
+
+    api_key = await _resolve_provider_key(db, provider, payload.api_key)
+    base_url = (payload.base_url or "").strip()
+
+    if provider != "ollama" and not api_key:
+        return ProviderTestResponse(
+            provider=provider,
+            success=False,
+            status_code=400,
+            message="API key is missing",
+        )
+
+    if provider == "ollama":
+        if not base_url:
+            base_url = await SystemSettingsManager.get_setting(db, "ollama_base_url") or ""
+        if not base_url:
+            return ProviderTestResponse(
+                provider=provider,
+                success=False,
+                status_code=400,
+                message="Ollama base URL is missing",
+            )
+        url = base_url.rstrip("/") + "/api/tags"
+        headers = {}
+    elif provider == "openai":
+        url = "https://api.openai.com/v1/models"
+        headers = {"Authorization": f"Bearer {api_key}"}
+    elif provider == "deepseek":
+        base = base_url or "https://api.deepseek.com"
+        url = base.rstrip("/") + "/models"
+        headers = {"Authorization": f"Bearer {api_key}"}
+    elif provider == "cohere":
+        url = "https://api.cohere.com/v1/models"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+        }
+    elif provider == "voyage":
+        url = "https://api.voyageai.com/v1/embeddings"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+    else:  # anthropic
+        url = "https://api.anthropic.com/v1/models"
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            if provider == "voyage":
+                from app.config import settings
+
+                response = await client.post(
+                    url,
+                    headers=headers,
+                    json={
+                        "model": settings.VOYAGE_EMBEDDING_MODEL,
+                        "input": ["ping"],
+                    },
+                )
+            else:
+                response = await client.get(url, headers=headers)
+        success = 200 <= response.status_code < 300
+        if success:
+            message = "Connection OK"
+        elif response.status_code in (401, 403):
+            message = "Unauthorized (check API key)"
+        else:
+            message = f"Unexpected response: {response.status_code}"
+        return ProviderTestResponse(
+            provider=provider,
+            success=success,
+            status_code=response.status_code,
+            message=message,
+        )
+    except httpx.RequestError as exc:
+        return ProviderTestResponse(
+            provider=provider,
+            success=False,
+            status_code=0,
+            message=f"Request failed: {exc.__class__.__name__}",
+        )

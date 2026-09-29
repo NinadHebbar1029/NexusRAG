@@ -1,0 +1,931 @@
+"""Document management endpoints."""
+
+import hashlib
+import json
+import logging
+import mimetypes
+from pathlib import Path
+from typing import Optional
+from uuid import UUID
+
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
+)
+from fastapi.responses import FileResponse
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.session import get_db
+from app.dependencies import get_current_user_id
+from app.models.database import Document as DocumentModel
+from app.models.database import KnowledgeBase as KnowledgeBaseModel
+from app.models.enums import DocumentStatus, FileType
+from app.models.schemas import (
+    DocumentFromUrlRequest,
+    DocumentList,
+    DocumentResponse,
+    DocumentWithContent,
+    UrlPreviewRequest,
+    UrlPreviewResponse,
+)
+from app.services.document_processor import get_document_processor
+from app.services.duplicate_chunks import compute_duplicate_chunks_for_document, json_dumps
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+_TRACKING_PREFIXES = ("utm_", "cx_", "mc_", "yclid")
+_TRACKING_PARAMS = frozenset({"fbclid", "gclid", "gclsrc", "msclkid", "igshid", "_ga", "twclid"})
+
+
+def _clean_url(raw: str, canonical: str | None = None) -> str:
+    """Prefer canonical URL from page; otherwise strip known tracking params and fragment."""
+    from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+
+    if canonical:
+        try:
+            raw_p = urlparse(raw)
+            can_p = urlparse(canonical)
+            if can_p.scheme in ("http", "https") and can_p.netloc == raw_p.netloc:
+                return canonical
+        except Exception:
+            pass
+
+    try:
+        parsed = urlparse(raw)
+        params = parse_qs(parsed.query, keep_blank_values=True)
+        clean = {
+            k: v
+            for k, v in params.items()
+            if not any(k.lower().startswith(p) for p in _TRACKING_PREFIXES)
+            and k.lower() not in _TRACKING_PARAMS
+        }
+        return urlunparse(parsed._replace(query=urlencode(clean, doseq=True), fragment=""))
+    except Exception:
+        return raw
+
+
+async def _process_document_background(
+    document_id: UUID,
+    detect_duplicates: bool = False,
+    contextual_description_enabled_override: Optional[bool] = None,
+):
+    """
+    Background task to process a document.
+
+    Args:
+        document_id: Document ID to process
+
+    Note: Always updates document status to FAILED if processing fails,
+    even if the main error handler couldn't commit the status change.
+    """
+    logger.info(f"[BACKGROUND] Starting background processing for document {document_id}")
+    try:
+        # Create a new DB session for background task
+        from app.db.session import AsyncSessionLocal
+
+        logger.info("[BACKGROUND] Creating DB session...")
+        async with AsyncSessionLocal() as db:
+            logger.info("[BACKGROUND] Getting document processor...")
+            processor = get_document_processor()
+            logger.info("[BACKGROUND] Calling process_document()...")
+            result = await processor.process_document(
+                document_id,
+                db,
+                detect_duplicates=detect_duplicates,
+                contextual_description_enabled_override=contextual_description_enabled_override,
+            )
+            logger.info(f"[BACKGROUND] Background processing completed: {result}")
+
+    except Exception as e:
+        logger.error(f"Background processing failed for document {document_id}: {e}")
+
+        # Ensure document status is updated to FAILED
+        # Use a fresh DB session in case the previous one is in a bad state
+        try:
+            from app.db.session import AsyncSessionLocal
+            from app.models.enums import DocumentStatus
+
+            async with AsyncSessionLocal() as db:
+                query = select(DocumentModel).where(DocumentModel.id == document_id)
+                result = await db.execute(query)
+                doc = result.scalar_one_or_none()
+
+                if doc:
+                    doc.status = DocumentStatus.FAILED
+                    doc.error_message = f"Processing failed: {str(e)}"
+                    db.add(doc)
+                    await db.commit()
+                    logger.info(f"Updated document {document_id} status to FAILED")
+                else:
+                    logger.error(f"Could not find document {document_id} to update status")
+
+        except Exception as update_error:
+            logger.error(f"Failed to update document status to FAILED: {update_error}")
+
+
+@router.post("/", response_model=DocumentResponse, status_code=status.HTTP_201_CREATED)
+async def create_document(
+    file: UploadFile = File(...),
+    knowledge_base_id: UUID = Form(...),
+    detect_duplicates: bool = Form(False),
+    contextual_description_enabled: Optional[bool] = Form(
+        None,
+        description=(
+            "Optional per-request override for contextual description generation during ingestion"
+        ),
+    ),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+    db: AsyncSession = Depends(get_db),
+    user_id: Optional[UUID] = Depends(get_current_user_id),
+):
+    """
+    Upload and process a document file.
+
+    Accepts file upload via multipart/form-data and processes it:
+    - Chunks the document text
+    - Generates embeddings for each chunk
+    - Indexes chunks in Qdrant vector database
+
+    Processing happens in the background. Check document status to monitor progress.
+
+    Supported formats (MVP): txt, md, fb2, docx
+    """
+    # Verify KB exists
+    kb_query = select(KnowledgeBaseModel).where(
+        KnowledgeBaseModel.id == knowledge_base_id,
+        KnowledgeBaseModel.is_deleted == False,
+    )
+    kb_result = await db.execute(kb_query)
+    kb = kb_result.scalar_one_or_none()
+
+    if not kb:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Knowledge base {knowledge_base_id} not found",
+        )
+
+    # Detect file type
+    filename = file.filename or "unnamed"
+    extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+    if extension == "txt":
+        file_type = FileType.TXT
+    elif extension == "md":
+        file_type = FileType.MD
+    elif extension == "fb2":
+        file_type = FileType.FB2
+    elif extension == "docx":
+        file_type = FileType.DOCX
+    elif extension == "pdf":
+        file_type = FileType.PDF
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported file type: {extension}. Supported: txt, md, fb2, docx, pdf",
+        )
+
+    # Read file content
+    content_bytes = await file.read()
+    content: str
+    heading_map_json: str | None = None
+    page_map_json: str | None = None
+    if file_type in (FileType.DOCX, FileType.FB2, FileType.PDF):
+        from app.services.pdf_parsing_settings import resolve_pdf_parsing_overrides
+        from app.utils.file_handlers import FileHandlerFactory
+
+        type_label = file_type.value.upper()
+        handler = FileHandlerFactory.get_handler(file_type)
+        profile_overrides = (
+            await resolve_pdf_parsing_overrides(db, kb) if file_type == FileType.PDF else None
+        )
+        try:
+            extracted = handler.extract_all(
+                content_bytes, filename, profile_overrides=profile_overrides
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to parse {type_label}: {exc}",
+            ) from exc
+
+        content = extracted.text
+        if extracted.headings:
+            heading_map_json = json.dumps(extracted.headings, ensure_ascii=False)
+        if extracted.page_map:
+            page_map_json = json.dumps(extracted.page_map)
+    else:
+        try:
+            content = content_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            import chardet
+
+            detected = chardet.detect(content_bytes)
+            encoding = detected.get("encoding")
+            if not encoding:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="File must be UTF-8 or a detectable text encoding",
+                )
+            content = content_bytes.decode(encoding, errors="replace")
+
+    # Validate file size
+    from app.config import settings
+
+    file_size = len(content_bytes)
+    if file_size > settings.max_file_size_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File size {file_size} bytes exceeds limit of {settings.MAX_FILE_SIZE_MB}MB",
+        )
+
+    # Calculate content hash for deduplication
+    content_hash = hashlib.sha256(content_bytes).hexdigest()
+
+    # Check for duplicate
+    dup_query = select(DocumentModel).where(
+        DocumentModel.knowledge_base_id == knowledge_base_id,
+        DocumentModel.content_hash == content_hash,
+        DocumentModel.is_deleted == False,
+    )
+    dup_result = await db.execute(dup_query)
+    if dup_result.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Document with identical content already exists in this knowledge base",
+        )
+
+    # Create document
+    doc_model = DocumentModel(
+        knowledge_base_id=knowledge_base_id,
+        filename=filename,
+        file_type=file_type,
+        file_size=file_size,
+        content=content,
+        content_hash=content_hash,
+        status=DocumentStatus.PENDING,
+        user_id=user_id,
+        heading_map_json=heading_map_json,
+        page_map_json=page_map_json,
+    )
+
+    db.add(doc_model)
+    await db.flush()  # Flush to make doc_model visible in queries
+
+    # Save original file to disk for future reprocessing
+    upload_path = Path("/app/uploads") / str(knowledge_base_id) / f"{doc_model.id}.{extension}"
+    try:
+        upload_path.parent.mkdir(parents=True, exist_ok=True)
+        upload_path.write_bytes(content_bytes)
+        doc_model.file_path = str(upload_path)
+    except Exception as exc:
+        logger.warning(f"Failed to save uploaded file to disk: {exc}")
+
+    # Recalculate KB document count (prevents desync from incremental updates)
+    doc_count = await db.scalar(
+        select(func.count(DocumentModel.id)).where(
+            DocumentModel.knowledge_base_id == kb.id, DocumentModel.is_deleted == False
+        )
+    )
+    kb.document_count = doc_count or 0
+
+    await db.commit()
+    await db.refresh(doc_model)
+
+    # Process document in background
+    logger.info(f"[UPLOAD] Adding background task for document {doc_model.id}")
+    background_tasks.add_task(
+        _process_document_background,
+        document_id=doc_model.id,
+        detect_duplicates=detect_duplicates,
+        contextual_description_enabled_override=contextual_description_enabled,
+    )
+    logger.info(f"[UPLOAD] Background task added successfully for document {doc_model.id}")
+
+    logger.info(f"Document {doc_model.id} ({filename}) uploaded and queued for processing")
+
+    return doc_model
+
+
+@router.post("/from-url/preview", response_model=UrlPreviewResponse)
+async def preview_url(request: UrlPreviewRequest):
+    """
+    Fetch and extract a URL without saving anything.
+
+    Returns title, metadata, and a short content preview so the user can
+    confirm the content before importing it into a knowledge base.
+    """
+    from app.services.url_extractor_client import (
+        Url2mdEmptyResult,
+        Url2mdExtractionError,
+        Url2mdUnavailable,
+        extract_url,
+    )
+
+    try:
+        page = await extract_url(request.url)
+    except Url2mdUnavailable as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
+    except Url2mdExtractionError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    except Url2mdEmptyResult as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+
+    content = page.content_md or ""
+    word_count = len(content.split())
+    clean_url = _clean_url(request.url, page.canonical_url)
+
+    return UrlPreviewResponse(
+        url=clean_url,
+        title=page.title,
+        description=page.description,
+        sitename=page.sitename,
+        author=page.author,
+        publish_date=page.publish_date,
+        language=page.language,
+        canonical_url=page.canonical_url,
+        content_md=content,
+        word_count=word_count,
+    )
+
+
+@router.post("/from-url", response_model=DocumentResponse, status_code=status.HTTP_201_CREATED)
+async def create_document_from_url(
+    request: DocumentFromUrlRequest,
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+    db: AsyncSession = Depends(get_db),
+    user_id: Optional[UUID] = Depends(get_current_user_id),
+):
+    """
+    Import a document from a URL.
+
+    Fetches the page via the url2md extraction service, converts it to Markdown,
+    then indexes it like any other document. The raw HTML is preserved on disk so
+    the document can be reprocessed without re-fetching.
+
+    Returns 503 if url2md is not running, 400 if the URL is invalid/blocked,
+    422 if the page has no extractable text (JS-rendered / paywalled).
+    """
+    from app.services.url_extractor_client import (
+        Url2mdEmptyResult,
+        Url2mdExtractionError,
+        Url2mdUnavailable,
+        extract_url,
+    )
+
+    # Verify KB exists
+    kb_query = select(KnowledgeBaseModel).where(
+        KnowledgeBaseModel.id == request.knowledge_base_id,
+        KnowledgeBaseModel.is_deleted == False,
+    )
+    kb_result = await db.execute(kb_query)
+    kb = kb_result.scalar_one_or_none()
+
+    if not kb:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Knowledge base {request.knowledge_base_id} not found",
+        )
+
+    # Fetch and extract via url2md
+    try:
+        page = await extract_url(request.url)
+    except Url2mdUnavailable as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
+    except Url2mdExtractionError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    except Url2mdEmptyResult as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+
+    clean_url = _clean_url(request.url, page.canonical_url)
+
+    # Check for duplicate source URL in this KB (using cleaned URL)
+    url_dup_query = select(DocumentModel).where(
+        DocumentModel.knowledge_base_id == request.knowledge_base_id,
+        DocumentModel.source_url == clean_url,
+        DocumentModel.is_deleted == False,
+    )
+    url_dup_result = await db.execute(url_dup_query)
+    if url_dup_result.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A document from this URL already exists in this knowledge base",
+        )
+
+    content = page.content_md
+    content_bytes = content.encode("utf-8")
+    content_hash = hashlib.sha256(content_bytes).hexdigest()
+
+    # Check for duplicate content in this KB
+    dup_query = select(DocumentModel).where(
+        DocumentModel.knowledge_base_id == request.knowledge_base_id,
+        DocumentModel.content_hash == content_hash,
+        DocumentModel.is_deleted == False,
+    )
+    dup_result = await db.execute(dup_query)
+    if dup_result.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Document with identical content already exists in this knowledge base",
+        )
+
+    # Derive a filename from title or hostname
+    from urllib.parse import urlparse as _urlparse
+
+    if page.title:
+        safe_title = "".join(c if c.isalnum() or c in " -_" else "_" for c in page.title)[:80]
+        filename = f"{safe_title.strip()}.md"
+    else:
+        hostname = _urlparse(request.url).hostname or "web"
+        filename = f"{hostname}.md"
+
+    # Build web_metadata JSON
+    web_metadata_dict = {
+        k: v
+        for k, v in {
+            "author": page.author,
+            "publish_date": page.publish_date,
+            "sitename": page.sitename,
+            "description": page.description,
+            "canonical_url": page.canonical_url,
+        }.items()
+        if v is not None
+    }
+
+    doc_model = DocumentModel(
+        knowledge_base_id=request.knowledge_base_id,
+        filename=filename,
+        file_type=FileType.MD,
+        file_size=len(content_bytes),
+        content=content,
+        content_hash=content_hash,
+        status=DocumentStatus.PENDING,
+        user_id=user_id,
+        language=page.language,
+        source_url=clean_url,
+        web_metadata=(
+            json.dumps(web_metadata_dict, ensure_ascii=False) if web_metadata_dict else None
+        ),
+    )
+
+    db.add(doc_model)
+    await db.flush()
+
+    # Save raw HTML to disk so reprocess works offline
+    if page.raw_html:
+        html_path = Path("/app/uploads") / str(request.knowledge_base_id) / f"{doc_model.id}.html"
+        try:
+            html_path.parent.mkdir(parents=True, exist_ok=True)
+            html_path.write_text(page.raw_html, encoding="utf-8")
+            doc_model.file_path = str(html_path)
+        except Exception as exc:
+            logger.warning(f"Failed to save raw HTML to disk: {exc}")
+
+    # Recalculate KB document count
+    doc_count = await db.scalar(
+        select(func.count(DocumentModel.id)).where(
+            DocumentModel.knowledge_base_id == kb.id, DocumentModel.is_deleted == False
+        )
+    )
+    kb.document_count = doc_count or 0
+
+    await db.commit()
+    await db.refresh(doc_model)
+
+    background_tasks.add_task(
+        _process_document_background,
+        document_id=doc_model.id,
+        detect_duplicates=request.detect_duplicates,
+        contextual_description_enabled_override=request.contextual_description_enabled,
+    )
+
+    logger.info(f"Document {doc_model.id} imported from {clean_url} and queued for processing")
+
+    return doc_model
+
+
+@router.get("/", response_model=DocumentList)
+async def list_documents(
+    knowledge_base_id: Optional[UUID] = Query(None, description="Filter by knowledge base"),
+    status_filter: Optional[DocumentStatus] = Query(
+        None, alias="status", description="Filter by status"
+    ),
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(10, ge=1, le=500, description="Items per page"),
+    db: AsyncSession = Depends(get_db),
+    user_id: Optional[UUID] = Depends(get_current_user_id),
+):
+    """
+    List documents with optional filtering.
+
+    Returns paginated list of documents.
+    Can filter by knowledge base and/or processing status.
+    """
+    # Build query
+    query = select(DocumentModel).where(DocumentModel.is_deleted == False)
+
+    if knowledge_base_id:
+        query = query.where(DocumentModel.knowledge_base_id == knowledge_base_id)
+
+    if status_filter:
+        query = query.where(DocumentModel.status == status_filter)
+
+    # Future: Add user filter when auth is implemented
+
+    # Count total
+    count_query = select(func.count()).select_from(query.subquery())
+    total = await db.scalar(count_query)
+
+    # Apply pagination
+    query = (
+        query.order_by(DocumentModel.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+
+    # Execute
+    result = await db.execute(query)
+    items = result.scalars().all()
+
+    return DocumentList(
+        items=items,
+        total=total or 0,
+        page=page,
+        page_size=page_size,
+        pages=(total + page_size - 1) // page_size if total else 0,
+    )
+
+
+@router.get("/{doc_id}", response_model=DocumentWithContent)
+async def get_document(
+    doc_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    user_id: Optional[UUID] = Depends(get_current_user_id),
+):
+    """
+    Get document by ID including full content.
+
+    Returns complete document information including the original content.
+    """
+    query = select(DocumentModel).where(
+        DocumentModel.id == doc_id,
+        DocumentModel.is_deleted == False,
+    )
+
+    result = await db.execute(query)
+    doc = result.scalar_one_or_none()
+
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Document {doc_id} not found"
+        )
+
+    # Future: Check user ownership
+
+    return doc
+
+
+@router.get("/{doc_id}/download")
+async def download_document(
+    doc_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    user_id: Optional[UUID] = Depends(get_current_user_id),
+):
+    """Download original uploaded file."""
+    result = await db.execute(
+        select(DocumentModel).where(
+            DocumentModel.id == doc_id,
+            DocumentModel.is_deleted == False,
+        )
+    )
+    doc = result.scalar_one_or_none()
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    if not doc.file_path or not Path(doc.file_path).exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Original file not available",
+        )
+
+    media_type, _ = mimetypes.guess_type(doc.filename)
+    return FileResponse(
+        path=doc.file_path,
+        filename=doc.filename,
+        media_type=media_type or "application/octet-stream",
+    )
+
+
+@router.delete("/{doc_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_document(
+    doc_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    user_id: Optional[UUID] = Depends(get_current_user_id),
+):
+    """
+    Delete document (soft delete).
+
+    Marks document as deleted and updates knowledge base statistics.
+    Associated vectors in Qdrant will also be deleted.
+    """
+    # Get document
+    query = select(DocumentModel).where(
+        DocumentModel.id == doc_id,
+        DocumentModel.is_deleted == False,
+    )
+    result = await db.execute(query)
+    doc = result.scalar_one_or_none()
+
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Document {doc_id} not found"
+        )
+
+    # Future: Check user ownership
+
+    # Get KB to update stats
+    kb_query = select(KnowledgeBaseModel).where(KnowledgeBaseModel.id == doc.knowledge_base_id)
+    kb_result = await db.execute(kb_query)
+    kb = kb_result.scalar_one_or_none()
+
+    # Soft delete document
+    doc.is_deleted = True
+
+    # Delete original file from disk
+    if doc.file_path:
+        try:
+            Path(doc.file_path).unlink(missing_ok=True)
+        except Exception as exc:
+            logger.warning(f"Failed to delete file {doc.file_path}: {exc}")
+
+    # Recalculate KB statistics (prevents desync from incremental updates)
+    if kb:
+        doc_count = await db.scalar(
+            select(func.count(DocumentModel.id)).where(
+                DocumentModel.knowledge_base_id == kb.id, DocumentModel.is_deleted == False
+            )
+        )
+        total_chunks = await db.scalar(
+            select(func.coalesce(func.sum(DocumentModel.chunk_count), 0)).where(
+                DocumentModel.knowledge_base_id == kb.id, DocumentModel.is_deleted == False
+            )
+        )
+        kb.document_count = doc_count or 0
+        kb.total_chunks = total_chunks or 0
+
+    await db.commit()
+
+    # Delete vectors from Qdrant
+    try:
+        processor = get_document_processor()
+        await processor.delete_document_vectors(
+            document_id=doc_id,
+            collection_name=kb.collection_name,
+        )
+        logger.info(f"Deleted vectors for document {doc_id} from Qdrant")
+    except Exception as e:
+        logger.error(f"Failed to delete vectors from Qdrant: {e}")
+        # Continue even if vector deletion fails (vectors will be orphaned)
+
+    return None
+
+
+@router.post("/{doc_id}/reprocess", response_model=DocumentResponse)
+async def reprocess_document(
+    doc_id: UUID,
+    background_tasks: BackgroundTasks,
+    detect_duplicates: bool = Query(
+        False, description="Compute duplicate chunks after reprocessing"
+    ),
+    contextual_description_enabled: Optional[bool] = Query(
+        None,
+        description=(
+            "Optional per-request override for contextual description generation during reprocessing"
+        ),
+    ),
+    db: AsyncSession = Depends(get_db),
+    user_id: Optional[UUID] = Depends(get_current_user_id),
+):
+    """
+    Reprocess an existing document.
+
+    Deletes old vectors and processes the document again:
+    - Re-chunks the document
+    - Regenerates embeddings
+    - Re-indexes in Qdrant
+
+    Useful if chunking strategy or embedding model has changed.
+    """
+    # Get document
+    query = select(DocumentModel).where(
+        DocumentModel.id == doc_id,
+        DocumentModel.is_deleted == False,
+    )
+    result = await db.execute(query)
+    doc = result.scalar_one_or_none()
+
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Document {doc_id} not found"
+        )
+
+    # Check if document is currently processing
+    if doc.status == DocumentStatus.PROCESSING:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="Document is currently being processed"
+        )
+
+    # Update status to pending
+    doc.status = DocumentStatus.PENDING
+    doc.embeddings_status = DocumentStatus.PENDING
+    doc.bm25_status = DocumentStatus.PENDING
+    doc.error_message = None
+    await db.commit()
+    await db.refresh(doc)
+
+    # Queue reprocessing in background
+    background_tasks.add_task(
+        _reprocess_document_background,
+        document_id=doc_id,
+        detect_duplicates=detect_duplicates,
+        contextual_description_enabled_override=contextual_description_enabled,
+    )
+
+    logger.info(f"Document {doc_id} queued for reprocessing")
+
+    return doc
+
+
+async def _reprocess_document_background(
+    document_id: UUID,
+    detect_duplicates: bool = False,
+    contextual_description_enabled_override: Optional[bool] = None,
+):
+    """
+    Background task to reprocess a document.
+
+    Note: Always updates document status to FAILED if reprocessing fails,
+    even if the main error handler couldn't commit the status change.
+    """
+    try:
+        from app.db.session import AsyncSessionLocal
+
+        async with AsyncSessionLocal() as db:
+            processor = get_document_processor()
+            result = await processor.reprocess_document(
+                document_id,
+                db,
+                detect_duplicates=detect_duplicates,
+                contextual_description_enabled_override=contextual_description_enabled_override,
+            )
+            logger.info(f"Background reprocessing completed: {result}")
+
+    except Exception as e:
+        logger.error(f"Background reprocessing failed for document {document_id}: {e}")
+
+        # Ensure document status is updated to FAILED
+        # Use a fresh DB session in case the previous one is in a bad state
+        try:
+            from app.db.session import AsyncSessionLocal
+            from app.models.enums import DocumentStatus
+
+            async with AsyncSessionLocal() as db:
+                query = select(DocumentModel).where(DocumentModel.id == document_id)
+                result = await db.execute(query)
+                doc = result.scalar_one_or_none()
+
+                if doc:
+                    doc.status = DocumentStatus.FAILED
+                    doc.embeddings_status = DocumentStatus.FAILED
+                    doc.bm25_status = DocumentStatus.FAILED
+                    doc.error_message = f"Reprocessing failed: {str(e)}"
+                    db.add(doc)
+                    await db.commit()
+                    logger.info(f"Updated document {document_id} status to FAILED")
+                else:
+                    logger.error(f"Could not find document {document_id} to update status")
+
+        except Exception as update_error:
+            logger.error(f"Failed to update document status to FAILED: {update_error}")
+
+
+@router.get("/{doc_id}/status", response_model=dict)
+async def get_document_status(
+    doc_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    user_id: Optional[UUID] = Depends(get_current_user_id),
+):
+    """
+    Get processing status of a document.
+
+    Returns current status and metadata about processing progress.
+    Always returns 200 OK with status info, even if processing failed.
+    """
+    try:
+        query = select(DocumentModel).where(
+            DocumentModel.id == doc_id,
+            DocumentModel.is_deleted == False,
+        )
+        result = await db.execute(query)
+        doc = result.scalar_one_or_none()
+
+        if not doc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=f"Document {doc_id} not found"
+            )
+
+        # Safe status extraction
+        doc_status = "unknown"
+        if doc.status:
+            try:
+                doc_status = doc.status.value if hasattr(doc.status, "value") else str(doc.status)
+            except Exception:
+                doc_status = "unknown"
+
+        return {
+            "id": str(doc.id),
+            "filename": doc.filename,
+            "status": doc_status,
+            "embeddings_status": (
+                (
+                    doc.embeddings_status.value
+                    if hasattr(doc.embeddings_status, "value")
+                    else str(doc.embeddings_status)
+                )
+                if doc.embeddings_status
+                else None
+            ),
+            "bm25_status": (
+                (
+                    doc.bm25_status.value
+                    if hasattr(doc.bm25_status, "value")
+                    else str(doc.bm25_status)
+                )
+                if doc.bm25_status
+                else None
+            ),
+            "chunk_count": doc.chunk_count or 0,
+            "error_message": doc.error_message,
+            "processing_stage": doc.processing_stage,
+            "progress_percentage": doc.progress_percentage or 0,
+        }
+
+    except HTTPException:
+        # Re-raise HTTP exceptions (like 404)
+        raise
+    except Exception as e:
+        # Catch any unexpected errors and return a safe response
+        logger.error(f"Error getting status for document {doc_id}: {e}")
+        return {
+            "id": str(doc_id),
+            "filename": "unknown",
+            "status": "error",
+            "chunk_count": 0,
+            "error_message": f"Failed to get document status: {str(e)}",
+        }
+
+
+@router.post("/{doc_id}/duplicates/recompute", response_model=dict)
+async def recompute_document_duplicates(
+    doc_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    user_id: Optional[UUID] = Depends(get_current_user_id),
+):
+    """
+    Recompute duplicate chunk analysis for a document (Qdrant payload scan only).
+    Stores summary in document metadata.
+    """
+    query = (
+        select(DocumentModel, KnowledgeBaseModel)
+        .join(
+            KnowledgeBaseModel,
+            DocumentModel.knowledge_base_id == KnowledgeBaseModel.id,
+        )
+        .where(
+            DocumentModel.id == doc_id,
+            DocumentModel.is_deleted == False,
+        )
+    )
+    result = await db.execute(query)
+    row = result.first()
+    if not row:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Document {doc_id} not found"
+        )
+
+    doc, kb = row
+    summary = await compute_duplicate_chunks_for_document(doc.id, kb.collection_name)
+    doc.duplicate_chunks_json = json_dumps(summary)
+    await db.commit()
+    await db.refresh(doc)
+
+    return summary

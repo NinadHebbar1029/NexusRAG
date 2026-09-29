@@ -1,0 +1,1031 @@
+"""FastMCP server exposing RAG tools."""
+
+import asyncio
+import hashlib
+import json
+import logging
+import time
+import uuid as _uuid
+from pathlib import Path
+from typing import Any, Dict, List, Optional, cast
+from urllib.parse import urlencode
+from uuid import UUID
+
+from fastapi import HTTPException
+from fastmcp import FastMCP
+from sqlalchemy import func, select
+
+from app.config import settings
+from app.core.embeddings_base import EMBEDDING_MODELS
+from app.core.retrieval import get_retrieval_engine
+from app.core.system_settings import SystemSettingsManager
+from app.core.vector_store import get_vector_store
+from app.db.session import get_db_session
+from app.models.database import AppSettings as AppSettingsModel
+from app.models.database import Document as DocumentModel
+from app.models.database import KnowledgeBase as KnowledgeBaseModel
+from app.models.enums import DocumentStatus, FileType
+from app.services.document_processor import get_document_processor
+from app.services.rag import get_rag_service
+from app.services.retrieval_settings import (
+    load_kb_retrieval_settings,
+    resolve_retrieval_settings,
+    resolve_retrieval_settings_scoped_with_explain,
+)
+
+logger = logging.getLogger(__name__)
+
+# Directory upload_document reads from when called with `path` instead of
+# content_base64 — files are expected to already be placed here (e.g. via
+# scp to the RAG host), since it's bind-mounted from ./uploads on the host.
+UPLOAD_INBOX_DIR = Path("/app/uploads/inbox")
+
+MCP_TOOL_NAMES = [
+    "rag_query",
+    "list_knowledge_bases",
+    "list_documents",
+    "retrieve_chunks",
+    "get_kb_retrieval_settings",
+    "set_kb_retrieval_settings",
+    "clear_kb_retrieval_settings",
+    "get_kb_effective_settings",
+    "create_knowledge_base",
+    "update_knowledge_base",
+    "delete_knowledge_base",
+    "ingest_url",
+    "ingest_text",
+    "upload_document",
+    "create_upload_url",
+    "delete_document",
+]
+
+
+async def _get_enabled_tools() -> List[str]:
+    async with get_db_session() as db:
+        raw = await SystemSettingsManager.get_setting(db, "mcp_tools_enabled")
+    if raw is None:
+        return settings.MCP_TOOLS_ENABLED
+    raw = raw.strip()
+    if raw.startswith("["):
+        try:
+            return cast(List[str], json.loads(raw))
+        except Exception:
+            return settings.MCP_TOOLS_ENABLED
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+async def _ensure_tool_enabled(name: str) -> Optional[str]:
+    enabled = await _get_enabled_tools()
+    if name not in enabled:
+        return f"Error: MCP tool '{name}' is disabled."
+    return None
+
+
+async def _get_kb(db, kb_id: Optional[str]) -> Optional[KnowledgeBaseModel]:
+    if not kb_id:
+        kb_id = settings.MCP_DEFAULT_KB_ID
+    if not kb_id:
+        return None
+    try:
+        kb_uuid = UUID(str(kb_id))
+    except Exception:
+        return None
+    return cast(Optional[KnowledgeBaseModel], await db.get(KnowledgeBaseModel, kb_uuid))
+
+
+def _format_sources(sources: List[Dict[str, Any]]) -> str:
+    lines: List[str] = []
+    for source in sources[:100]:
+        filename = source.get("filename", "unknown")
+        chunk_index = source.get("chunk_index", "?")
+        score = source.get("score", "?")
+        snippet = source.get("text", "").strip().replace("\n", " ")
+        if len(snippet) > 200:
+            snippet = snippet[:200] + "…"
+        lines.append(f"- {filename} (chunk {chunk_index}, score {score}): {snippet}")
+    return "\n".join(lines)
+
+
+def _parse_document_ids(value: Any) -> Optional[List[str]]:
+    """Parse optional document_ids option into a normalized list of UUID strings."""
+    if value is None:
+        return None
+
+    values = value if isinstance(value, list) else [value]
+    parsed: List[str] = []
+    for item in values:
+        try:
+            parsed.append(str(UUID(str(item))))
+        except Exception:
+            continue
+    return parsed or None
+
+
+def build_mcp_app() -> FastMCP:
+    mcp = FastMCP("RAG MCP Server")
+
+    @mcp.tool()
+    async def rag_query(
+        question: str,
+        knowledge_base_id: Optional[str] = None,
+        conversation_id: Optional[str] = None,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Query the RAG backend and return answer with sources."""
+        disabled = await _ensure_tool_enabled("rag_query")
+        if disabled:
+            return disabled
+
+        async with get_db_session() as db:
+            kb = await _get_kb(db, knowledge_base_id)
+            if not kb:
+                return "Error: knowledge_base_id is required (no default configured)."
+            if kb.is_deleted:
+                return f"Error: knowledge base {kb.id} is deleted."
+            if kb.document_count == 0:
+                return "Error: knowledge base is empty."
+
+            settings_result = await db.execute(
+                select(AppSettingsModel).order_by(AppSettingsModel.id).limit(1)
+            )
+            app_settings = settings_result.scalar_one_or_none()
+
+            options_payload = options or {}
+            overrides = dict(options_payload)
+            document_ids = _parse_document_ids(overrides.pop("document_ids", None))
+            effective = resolve_retrieval_settings(
+                kb=kb, app_settings=app_settings, overrides=overrides
+            )
+
+            rag_service = get_rag_service()
+            response = await rag_service.query(
+                question=question,
+                collection_name=kb.collection_name,
+                embedding_model=kb.embedding_model,
+                top_k=effective.get("top_k", 5),
+                retrieval_mode=effective.get("retrieval_mode", "dense"),
+                lexical_top_k=effective.get("lexical_top_k"),
+                dense_weight=effective.get("hybrid_dense_weight", 0.6),
+                lexical_weight=effective.get("hybrid_lexical_weight", 0.4),
+                bm25_match_mode=effective.get("bm25_match_mode"),
+                bm25_min_should_match=effective.get("bm25_min_should_match"),
+                bm25_use_phrase=effective.get("bm25_use_phrase"),
+                bm25_analyzer=effective.get("bm25_analyzer"),
+                temperature=effective.get("temperature", 0.7),
+                max_tokens=effective.get("max_tokens"),
+                max_context_chars=effective.get("max_context_chars"),
+                score_threshold=effective.get("score_threshold"),
+                llm_model=effective.get("llm_model"),
+                llm_provider=effective.get("llm_provider"),
+                rerank_enabled=effective.get("rerank_enabled", False),
+                rerank_provider=effective.get("rerank_provider"),
+                rerank_model=effective.get("rerank_model"),
+                rerank_candidate_pool=effective.get("rerank_candidate_pool"),
+                rerank_top_n=effective.get("rerank_top_n"),
+                rerank_min_score=effective.get("rerank_min_score"),
+                use_mmr=effective.get("use_mmr", False),
+                mmr_diversity=effective.get("mmr_diversity", 0.5),
+                document_ids=document_ids,
+                context_expansion=effective.get("context_expansion"),
+                context_window=effective.get("context_window"),
+                db=db,
+                kb_id=kb.id,
+            )
+
+        parts = [response.answer]
+        if conversation_id:
+            parts.append(f"\nConversation ID: {conversation_id}")
+        if response.sources:
+            source_lines = _format_sources([s.model_dump() for s in response.sources])
+            if source_lines:
+                parts.append("\nSources:\n" + source_lines)
+        return "\n".join(p for p in parts if p)
+
+    @mcp.tool()
+    async def list_knowledge_bases(page: int = 1, page_size: int = 50) -> str:
+        """List knowledge bases in the backend."""
+        disabled = await _ensure_tool_enabled("list_knowledge_bases")
+        if disabled:
+            return disabled
+
+        async with get_db_session() as db:
+            result = await db.execute(
+                select(KnowledgeBaseModel)
+                .where(KnowledgeBaseModel.is_deleted == False)
+                .order_by(KnowledgeBaseModel.created_at.desc())
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+            )
+            items = result.scalars().all()
+
+        if not items:
+            return "No knowledge bases found."
+
+        lines = []
+        for kb in items:
+            lines.append(f"- {kb.name} (id={kb.id}, documents={kb.document_count})")
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def list_documents(knowledge_base_id: str, page: int = 1, page_size: int = 100) -> str:
+        """List documents for a knowledge base."""
+        disabled = await _ensure_tool_enabled("list_documents")
+        if disabled:
+            return disabled
+
+        async with get_db_session() as db:
+            kb = await _get_kb(db, knowledge_base_id)
+            if not kb:
+                return "Error: knowledge_base_id is required."
+            result = await db.execute(
+                select(DocumentModel)
+                .where(DocumentModel.knowledge_base_id == kb.id, DocumentModel.is_deleted == False)
+                .order_by(DocumentModel.created_at.desc())
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+            )
+            rows = result.scalars().all()
+
+        if not rows:
+            return "No documents found for this knowledge base."
+
+        lines = []
+        for doc in rows:
+            lines.append(f"- {doc.filename} (id={doc.id}, status={doc.status})")
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def retrieve_chunks(
+        query: str,
+        knowledge_base_id: str,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Retrieve relevant chunks without generating an answer."""
+        disabled = await _ensure_tool_enabled("retrieve_chunks")
+        if disabled:
+            return disabled
+
+        async with get_db_session() as db:
+            kb = await _get_kb(db, knowledge_base_id)
+            if not kb:
+                return "Error: knowledge_base_id is required."
+            if kb.document_count == 0:
+                return "Error: knowledge base is empty."
+
+            settings_result = await db.execute(
+                select(AppSettingsModel).order_by(AppSettingsModel.id).limit(1)
+            )
+            app_settings = settings_result.scalar_one_or_none()
+
+            options_payload = options or {}
+            overrides = dict(options_payload)
+            document_ids = _parse_document_ids(overrides.pop("document_ids", None))
+            effective = resolve_retrieval_settings(
+                kb=kb, app_settings=app_settings, overrides=overrides
+            )
+            document_filter = None
+            if document_ids:
+                document_filter = {
+                    "document_id": document_ids if len(document_ids) > 1 else document_ids[0]
+                }
+
+            retrieval_engine = get_retrieval_engine()
+            mode = effective.get("retrieval_mode")
+            mode = getattr(mode, "value", mode)
+
+            if mode == "hybrid":
+                retrieval_result = await retrieval_engine.retrieve_hybrid(
+                    query=query,
+                    collection_name=kb.collection_name,
+                    embedding_model=kb.embedding_model,
+                    knowledge_base_id=str(kb.id),
+                    top_k=effective.get("top_k", 5),
+                    lexical_top_k=effective.get("lexical_top_k"),
+                    score_threshold=effective.get("score_threshold"),
+                    filters=document_filter,
+                    dense_weight=effective.get("hybrid_dense_weight", 0.6),
+                    lexical_weight=effective.get("hybrid_lexical_weight", 0.4),
+                    bm25_match_mode=effective.get("bm25_match_mode"),
+                    bm25_min_should_match=effective.get("bm25_min_should_match"),
+                    bm25_use_phrase=effective.get("bm25_use_phrase"),
+                    bm25_analyzer=effective.get("bm25_analyzer"),
+                    use_mmr=effective.get("use_mmr", False),
+                    mmr_diversity=effective.get("mmr_diversity", 0.5),
+                )
+            else:
+                retrieval_result = await retrieval_engine.retrieve(
+                    query=query,
+                    collection_name=kb.collection_name,
+                    embedding_model=kb.embedding_model,
+                    top_k=effective.get("top_k", 5),
+                    score_threshold=effective.get("score_threshold"),
+                    filters=document_filter,
+                    use_mmr=effective.get("use_mmr", False),
+                    mmr_diversity=effective.get("mmr_diversity", 0.5),
+                )
+
+            chunks = retrieval_result.chunks
+            if effective.get("rerank_enabled") and chunks:
+                candidate_pool = effective.get("rerank_candidate_pool") or len(chunks)
+                candidate_pool = max(1, min(candidate_pool, len(chunks)))
+                reranked = await retrieval_engine.rerank_results(
+                    query=query,
+                    chunks=chunks[:candidate_pool],
+                    provider=effective.get("rerank_provider"),
+                    model=effective.get("rerank_model"),
+                    min_score=effective.get("rerank_min_score"),
+                )
+                keep_n = effective.get("rerank_top_n") or effective.get("top_k", len(reranked))
+                keep_n = max(1, min(keep_n, len(reranked)))
+                chunks = reranked[:keep_n]
+
+            context = retrieval_engine._assemble_context(
+                chunks, max_length=effective.get("max_context_chars")
+            )
+
+        if not chunks:
+            return "No results."
+
+        lines = []
+        lines.append(f"Total found: {len(chunks)}")
+        if context:
+            lines.append("Context used:")
+            lines.append(context)
+        source_lines = _format_sources([chunk.model_dump() for chunk in chunks])
+        if source_lines:
+            lines.append("Sources:")
+            lines.append(source_lines)
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def get_kb_retrieval_settings(knowledge_base_id: str) -> str:
+        """Get retrieval settings for a knowledge base."""
+        disabled = await _ensure_tool_enabled("get_kb_retrieval_settings")
+        if disabled:
+            return disabled
+
+        async with get_db_session() as db:
+            kb = await _get_kb(db, knowledge_base_id)
+            if not kb:
+                return "Error: knowledge_base_id is required."
+            settings_result = await db.execute(
+                select(AppSettingsModel).order_by(AppSettingsModel.id).limit(1)
+            )
+            app_settings = settings_result.scalar_one_or_none()
+            stored = load_kb_retrieval_settings(kb)
+            effective, explain = resolve_retrieval_settings_scoped_with_explain(
+                kb=kb,
+                app_settings=app_settings,
+                conversation_overrides=None,
+                request_overrides=None,
+            )
+
+        payload = {
+            "stored": stored,
+            "effective": effective,
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    @mcp.tool()
+    async def set_kb_retrieval_settings(
+        knowledge_base_id: str, settings_payload: Dict[str, Any]
+    ) -> str:
+        """Set retrieval settings for a knowledge base."""
+        disabled = await _ensure_tool_enabled("set_kb_retrieval_settings")
+        if disabled:
+            return disabled
+
+        async with get_db_session() as db:
+            kb = await _get_kb(db, knowledge_base_id)
+            if not kb:
+                return "Error: knowledge_base_id is required."
+            kb.retrieval_settings_json = json.dumps(settings_payload) if settings_payload else None
+            await db.commit()
+        return "OK"
+
+    @mcp.tool()
+    async def clear_kb_retrieval_settings(knowledge_base_id: str) -> str:
+        """Clear retrieval settings for a knowledge base."""
+        disabled = await _ensure_tool_enabled("clear_kb_retrieval_settings")
+        if disabled:
+            return disabled
+
+        async with get_db_session() as db:
+            kb = await _get_kb(db, knowledge_base_id)
+            if not kb:
+                return "Error: knowledge_base_id is required."
+            kb.retrieval_settings_json = None
+            await db.commit()
+        return "OK"
+
+    @mcp.tool()
+    async def get_kb_effective_settings(knowledge_base_id: str) -> str:
+        """Return KB configuration and effective retrieval settings."""
+        disabled = await _ensure_tool_enabled("get_kb_effective_settings")
+        if disabled:
+            return disabled
+
+        async with get_db_session() as db:
+            kb = await _get_kb(db, knowledge_base_id)
+            if not kb:
+                return "Error: knowledge_base_id is required."
+
+            settings_result = await db.execute(
+                select(AppSettingsModel).order_by(AppSettingsModel.id).limit(1)
+            )
+            app_settings = settings_result.scalar_one_or_none()
+
+            stored = load_kb_retrieval_settings(kb)
+            effective, explain = resolve_retrieval_settings_scoped_with_explain(
+                kb=kb,
+                app_settings=app_settings,
+                conversation_overrides=None,
+                request_overrides=None,
+            )
+
+            payload = {
+                "knowledge_base": {
+                    "id": str(kb.id),
+                    "name": kb.name,
+                    "collection_name": kb.collection_name,
+                    "embedding_model": kb.embedding_model,
+                    "embedding_provider": kb.embedding_provider,
+                    "embedding_dimension": kb.embedding_dimension,
+                    "chunk_size": kb.chunk_size,
+                    "chunk_overlap": kb.chunk_overlap,
+                    "chunking_strategy": (
+                        kb.chunking_strategy.value
+                        if hasattr(kb.chunking_strategy, "value")
+                        else str(kb.chunking_strategy)
+                    ),
+                    "upsert_batch_size": kb.upsert_batch_size,
+                    "use_llm_chat_titles": kb.use_llm_chat_titles,
+                    "document_count": kb.document_count,
+                    "total_chunks": kb.total_chunks,
+                },
+                "retrieval": {
+                    "stored": stored,
+                    "effective": effective,
+                    "explain": explain,
+                },
+                "app_defaults": (
+                    {
+                        "llm_model": app_settings.llm_model,
+                        "llm_provider": app_settings.llm_provider,
+                        "temperature": app_settings.temperature,
+                        "top_k": app_settings.top_k,
+                        "max_context_chars": app_settings.max_context_chars,
+                        "score_threshold": app_settings.score_threshold,
+                        "rerank_enabled": app_settings.rerank_enabled,
+                        "rerank_provider": app_settings.rerank_provider,
+                        "rerank_model": app_settings.rerank_model,
+                        "rerank_candidate_pool": app_settings.rerank_candidate_pool,
+                        "rerank_top_n": app_settings.rerank_top_n,
+                        "rerank_min_score": app_settings.rerank_min_score,
+                        "retrieval_mode": app_settings.retrieval_mode,
+                        "lexical_top_k": app_settings.lexical_top_k,
+                        "hybrid_dense_weight": app_settings.hybrid_dense_weight,
+                        "hybrid_lexical_weight": app_settings.hybrid_lexical_weight,
+                        "bm25_match_mode": app_settings.bm25_match_mode,
+                        "bm25_min_should_match": app_settings.bm25_min_should_match,
+                        "bm25_use_phrase": app_settings.bm25_use_phrase,
+                        "bm25_analyzer": app_settings.bm25_analyzer,
+                        "kb_chunk_size": app_settings.kb_chunk_size,
+                        "kb_chunk_overlap": app_settings.kb_chunk_overlap,
+                        "kb_upsert_batch_size": app_settings.kb_upsert_batch_size,
+                        "use_llm_chat_titles": app_settings.use_llm_chat_titles,
+                    }
+                    if app_settings
+                    else None
+                ),
+            }
+
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    # ------------------------------------------------------------------ #
+    # Ingestion tools                                                       #
+    # ------------------------------------------------------------------ #
+
+    async def _background_process(document_id: UUID) -> None:
+        from app.db.session import AsyncSessionLocal
+
+        assert AsyncSessionLocal is not None, "DB engine not initialized"
+        try:
+            async with AsyncSessionLocal() as db:
+                processor = get_document_processor()
+                await processor.process_document(document_id, db)
+        except Exception as exc:
+            logger.error("MCP background processing failed for %s: %s", document_id, exc)
+            from app.db.session import AsyncSessionLocal
+
+            assert AsyncSessionLocal is not None, "DB engine not initialized"
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(
+                    select(DocumentModel).where(DocumentModel.id == document_id)
+                )
+                doc = result.scalar_one_or_none()
+                if doc:
+                    doc.status = DocumentStatus.FAILED
+                    doc.error_message = str(exc)
+                    await db.commit()
+
+    @mcp.tool()
+    async def create_knowledge_base(
+        name: str,
+        description: Optional[str] = None,
+        embedding_model: Optional[str] = None,
+        chunk_size: Optional[int] = None,
+        chunk_overlap: Optional[int] = None,
+    ) -> str:
+        """Create a new knowledge base. Returns the new KB id and name."""
+        disabled = await _ensure_tool_enabled("create_knowledge_base")
+        if disabled:
+            return disabled
+
+        model = embedding_model or "text-embedding-3-large"
+        if model not in EMBEDDING_MODELS:
+            return f"Error: unknown embedding_model '{model}'. Available: {', '.join(EMBEDDING_MODELS)}"
+
+        model_config = EMBEDDING_MODELS[model]
+
+        async with get_db_session() as db:
+            settings_result = await db.execute(
+                select(AppSettingsModel).order_by(AppSettingsModel.id).limit(1)
+            )
+            app_settings = settings_result.scalar_one_or_none()
+
+            default_chunk_size = (
+                app_settings.kb_chunk_size if app_settings and app_settings.kb_chunk_size else 1000
+            )
+            default_chunk_overlap = (
+                app_settings.kb_chunk_overlap
+                if app_settings and app_settings.kb_chunk_overlap
+                else 200
+            )
+            default_batch = (
+                app_settings.kb_upsert_batch_size
+                if app_settings and app_settings.kb_upsert_batch_size
+                else 256
+            )
+
+            kb_id = _uuid.uuid4()
+            from app.api.v1.knowledge_bases import kb_id_to_collection_name
+
+            collection_name = kb_id_to_collection_name(kb_id)
+
+            kb_model = KnowledgeBaseModel(
+                id=kb_id,
+                name=name,
+                description=description,
+                collection_name=collection_name,
+                embedding_model=model,
+                embedding_provider=model_config.provider.value,
+                embedding_dimension=model_config.dimension,
+                chunk_size=chunk_size or default_chunk_size,
+                chunk_overlap=chunk_overlap or default_chunk_overlap,
+                upsert_batch_size=default_batch,
+            )
+            db.add(kb_model)
+            await db.commit()
+
+            try:
+                vector_store = get_vector_store()
+                await vector_store.create_collection(
+                    collection_name=collection_name,
+                    vector_size=model_config.dimension,
+                )
+            except Exception as exc:
+                await db.delete(kb_model)
+                await db.commit()
+                return f"Error: failed to create vector collection: {exc}"
+
+        return f"Created knowledge base '{name}' (id={kb_id}, model={model})"
+
+    @mcp.tool()
+    async def update_knowledge_base(
+        knowledge_base_id: str,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        chunk_size: Optional[int] = None,
+        chunk_overlap: Optional[int] = None,
+    ) -> str:
+        """Update a knowledge base's name, description, or chunking config."""
+        disabled = await _ensure_tool_enabled("update_knowledge_base")
+        if disabled:
+            return disabled
+
+        try:
+            kb_uuid = UUID(str(knowledge_base_id))
+        except Exception:
+            return "Error: invalid knowledge_base_id."
+
+        update_fields: Dict[str, Any] = {
+            k: v
+            for k, v in {
+                "name": name,
+                "description": description,
+                "chunk_size": chunk_size,
+                "chunk_overlap": chunk_overlap,
+            }.items()
+            if v is not None
+        }
+        if not update_fields:
+            return "Error: at least one field to update must be provided."
+
+        from app.api.v1.knowledge_bases import update_knowledge_base as _api_update_kb
+        from app.models.schemas import KnowledgeBaseUpdate
+
+        async with get_db_session() as db:
+            try:
+                kb = await _api_update_kb(
+                    kb_id=kb_uuid,
+                    kb_update=KnowledgeBaseUpdate(**update_fields),
+                    db=db,
+                    user_id=None,
+                )
+            except HTTPException as exc:
+                return f"Error: {exc.detail}"
+
+        return f"Updated knowledge base '{kb.name}' (id={kb.id})"
+
+    @mcp.tool()
+    async def delete_knowledge_base(knowledge_base_id: str) -> str:
+        """Soft-delete a knowledge base, its documents, and their vectors."""
+        disabled = await _ensure_tool_enabled("delete_knowledge_base")
+        if disabled:
+            return disabled
+
+        try:
+            kb_uuid = UUID(str(knowledge_base_id))
+        except Exception:
+            return "Error: invalid knowledge_base_id."
+
+        from app.api.v1.knowledge_bases import delete_knowledge_base as _api_delete_kb
+
+        async with get_db_session() as db:
+            try:
+                await _api_delete_kb(kb_id=kb_uuid, db=db, user_id=None)
+            except HTTPException as exc:
+                return f"Error: {exc.detail}"
+
+        return f"Deleted knowledge base {knowledge_base_id}."
+
+    @mcp.tool()
+    async def ingest_url(url: str, knowledge_base_id: str) -> str:
+        """Fetch a URL, extract its text, and add it as a document to a knowledge base."""
+        disabled = await _ensure_tool_enabled("ingest_url")
+        if disabled:
+            return disabled
+
+        async with get_db_session() as db:
+            kb = await _get_kb(db, knowledge_base_id)
+            if not kb:
+                return "Error: knowledge_base_id not found."
+
+            from app.services.url_extractor_client import (
+                Url2mdEmptyResult,
+                Url2mdExtractionError,
+                Url2mdUnavailable,
+                extract_url,
+            )
+
+            try:
+                page = await extract_url(url)
+            except Url2mdUnavailable as exc:
+                return f"Error: url2md service unavailable — {exc}"
+            except Url2mdExtractionError as exc:
+                return f"Error: extraction failed — {exc}"
+            except Url2mdEmptyResult as exc:
+                return f"Error: no content extracted — {exc}"
+
+            from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+
+            def _clean(raw: str, canonical: Optional[str]) -> str:
+                _TRACKING_PREFIXES = ("utm_", "cx_", "mc_", "yclid")
+                _TRACKING_PARAMS = frozenset({"fbclid", "gclid", "gclsrc", "msclkid", "_ga"})
+                if canonical:
+                    try:
+                        rp, cp = urlparse(raw), urlparse(canonical)
+                        if cp.scheme in ("http", "https") and cp.netloc == rp.netloc:
+                            return canonical
+                    except Exception:
+                        pass
+                try:
+                    parsed = urlparse(raw)
+                    params = parse_qs(parsed.query, keep_blank_values=True)
+                    clean = {
+                        k: v
+                        for k, v in params.items()
+                        if not any(k.lower().startswith(p) for p in _TRACKING_PREFIXES)
+                        and k.lower() not in _TRACKING_PARAMS
+                    }
+                    return urlunparse(
+                        parsed._replace(query=urlencode(clean, doseq=True), fragment="")
+                    )
+                except Exception:
+                    return raw
+
+            clean_url = _clean(url, page.canonical_url)
+            content = page.content_md
+            content_bytes = content.encode("utf-8")
+            content_hash = hashlib.sha256(content_bytes).hexdigest()
+
+            dup = await db.scalar(
+                select(DocumentModel).where(
+                    DocumentModel.knowledge_base_id == kb.id,
+                    DocumentModel.source_url == clean_url,
+                    DocumentModel.is_deleted == False,
+                )
+            )
+            if dup:
+                return f"Error: a document from this URL already exists (id={dup.id})."
+
+            dup_content = await db.scalar(
+                select(DocumentModel).where(
+                    DocumentModel.knowledge_base_id == kb.id,
+                    DocumentModel.content_hash == content_hash,
+                    DocumentModel.is_deleted == False,
+                )
+            )
+            if dup_content:
+                return f"Error: identical content already indexed (id={dup_content.id})."
+
+            if page.title:
+                safe = "".join(c if c.isalnum() or c in " -_" else "_" for c in page.title)[:80]
+                filename = f"{safe.strip()}.md"
+            else:
+                from urllib.parse import urlparse as _up
+
+                filename = f"{_up(url).hostname or 'web'}.md"
+
+            web_meta = {
+                k: v
+                for k, v in {
+                    "author": page.author,
+                    "publish_date": page.publish_date,
+                    "sitename": page.sitename,
+                    "description": page.description,
+                    "canonical_url": page.canonical_url,
+                }.items()
+                if v is not None
+            }
+
+            doc = DocumentModel(
+                knowledge_base_id=kb.id,
+                filename=filename,
+                file_type=FileType.MD,
+                file_size=len(content_bytes),
+                content=content,
+                content_hash=content_hash,
+                status=DocumentStatus.PENDING,
+                language=page.language,
+                source_url=clean_url,
+                web_metadata=json.dumps(web_meta, ensure_ascii=False) if web_meta else None,
+            )
+            db.add(doc)
+            count = await db.scalar(
+                select(func.count(DocumentModel.id)).where(
+                    DocumentModel.knowledge_base_id == kb.id, DocumentModel.is_deleted == False
+                )
+            )
+            kb.document_count = (count or 0) + 1
+            await db.commit()
+            await db.refresh(doc)
+            doc_id = doc.id
+
+        asyncio.create_task(_background_process(doc_id))
+        return f"Ingested '{filename}' from {clean_url} (id={doc_id}). Processing started."
+
+    @mcp.tool()
+    async def ingest_text(
+        knowledge_base_id: str,
+        content: str,
+        filename: Optional[str] = None,
+        title: Optional[str] = None,
+    ) -> str:
+        """Add a plain-text or markdown document directly to a knowledge base."""
+        disabled = await _ensure_tool_enabled("ingest_text")
+        if disabled:
+            return disabled
+
+        if not content or not content.strip():
+            return "Error: content cannot be empty."
+
+        fname = filename
+        if not fname:
+            if title:
+                safe = "".join(c if c.isalnum() or c in " -_" else "_" for c in title)[:80]
+                fname = f"{safe.strip()}.md"
+            else:
+                fname = "document.md"
+
+        content_bytes = content.encode("utf-8")
+        content_hash = hashlib.sha256(content_bytes).hexdigest()
+
+        async with get_db_session() as db:
+            kb = await _get_kb(db, knowledge_base_id)
+            if not kb:
+                return "Error: knowledge_base_id not found."
+
+            dup = await db.scalar(
+                select(DocumentModel).where(
+                    DocumentModel.knowledge_base_id == kb.id,
+                    DocumentModel.content_hash == content_hash,
+                    DocumentModel.is_deleted == False,
+                )
+            )
+            if dup:
+                return f"Error: identical content already indexed (id={dup.id})."
+
+            doc = DocumentModel(
+                knowledge_base_id=kb.id,
+                filename=fname,
+                file_type=FileType.MD,
+                file_size=len(content_bytes),
+                content=content,
+                content_hash=content_hash,
+                status=DocumentStatus.PENDING,
+            )
+            db.add(doc)
+            count = await db.scalar(
+                select(func.count(DocumentModel.id)).where(
+                    DocumentModel.knowledge_base_id == kb.id, DocumentModel.is_deleted == False
+                )
+            )
+            kb.document_count = (count or 0) + 1
+            await db.commit()
+            await db.refresh(doc)
+            doc_id = doc.id
+
+        asyncio.create_task(_background_process(doc_id))
+        return f"Ingested '{fname}' (id={doc_id}, {len(content_bytes)} bytes). Processing started."
+
+    @mcp.tool()
+    async def upload_document(
+        knowledge_base_id: str,
+        filename: Optional[str] = None,
+        content_base64: Optional[str] = None,
+        path: Optional[str] = None,
+    ) -> str:
+        """Upload a binary document (pdf, docx, fb2, txt, or md).
+
+        Provide exactly ONE of:
+        - content_base64: base64-encoded file bytes, passed inline. Fine for
+          small files, but the calling agent's own tool-call context usually
+          truncates well under 1MB — impractical for most PDFs.
+        - path: filename (or relative path) of a file already placed under
+          the uploads/inbox/ directory on the RAG host (e.g. via scp), read
+          directly from disk with no base64 round-trip. Recommended for PDFs
+          and anything over a few tens of KB.
+
+        Use this instead of ingest_text/ingest_url when the original file format
+        matters — PDF page numbers, DOCX/FB2 structural headings, or when the
+        original file needs to stay downloadable. For plain text/markdown that
+        the agent authored itself, prefer ingest_text (no upload overhead).
+        """
+        disabled = await _ensure_tool_enabled("upload_document")
+        if disabled:
+            return disabled
+
+        try:
+            kb_uuid = UUID(str(knowledge_base_id))
+        except Exception:
+            return "Error: invalid knowledge_base_id."
+
+        if bool(content_base64) == bool(path):
+            return "Error: provide exactly one of content_base64 or path."
+
+        if path:
+            inbox_dir = UPLOAD_INBOX_DIR.resolve()
+            inbox_dir.mkdir(parents=True, exist_ok=True)
+            candidate = (inbox_dir / path).resolve()
+            try:
+                candidate.relative_to(inbox_dir)
+            except ValueError:
+                return "Error: path must stay within the uploads/inbox directory."
+            if not candidate.is_file():
+                return f"Error: file not found in uploads/inbox: {path}"
+            content_bytes = candidate.read_bytes()
+            filename = filename or candidate.name
+        else:
+            import base64
+            import binascii
+
+            if not filename:
+                return "Error: filename is required when using content_base64."
+            assert content_base64 is not None
+            try:
+                content_bytes = base64.b64decode(content_base64, validate=True)
+            except (binascii.Error, ValueError):
+                return "Error: content_base64 is not valid base64."
+
+        from io import BytesIO
+
+        from fastapi import BackgroundTasks, UploadFile
+
+        from app.api.v1.documents import create_document as _api_create_document
+
+        upload_file = UploadFile(BytesIO(content_bytes), filename=filename, size=len(content_bytes))
+        background_tasks = BackgroundTasks()
+
+        async with get_db_session() as db:
+            try:
+                doc = await _api_create_document(
+                    file=upload_file,
+                    knowledge_base_id=kb_uuid,
+                    detect_duplicates=False,
+                    contextual_description_enabled=None,
+                    background_tasks=background_tasks,
+                    db=db,
+                    user_id=None,
+                )
+            except HTTPException as exc:
+                return f"Error: {exc.detail}"
+
+        asyncio.create_task(background_tasks())
+        return (
+            f"Uploaded '{filename}' (id={doc.id}, {len(content_bytes)} bytes). "
+            "Processing started."
+        )
+
+    @mcp.tool()
+    async def create_upload_url(knowledge_base_id: str, filename: str) -> str:
+        """Generate a short-lived, single-use signed URL for uploading a large
+        binary document via a plain HTTP PUT.
+
+        Use this when content_base64 is impractical (large files typically
+        truncate in the calling agent's own tool-output limits well before
+        reaching our server) and the file isn't already reachable via the
+        uploads/inbox/ `path` option on upload_document. File bytes never
+        pass through this tool call or the calling agent's context — the
+        returned URL is consumed with a plain HTTP PUT (e.g.
+        `curl -X PUT -T file.pdf '<url>'`), expires in 5 minutes, and works
+        exactly once.
+        """
+        disabled = await _ensure_tool_enabled("create_upload_url")
+        if disabled:
+            return disabled
+
+        try:
+            kb_uuid = UUID(str(knowledge_base_id))
+        except Exception:
+            return "Error: invalid knowledge_base_id."
+
+        extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        if extension not in {"txt", "md", "fb2", "docx", "pdf"}:
+            return (
+                f"Error: Unsupported file type: {extension}. " "Supported: txt, md, fb2, docx, pdf"
+            )
+
+        async with get_db_session() as db:
+            kb = await db.get(KnowledgeBaseModel, kb_uuid)
+            if not kb or kb.is_deleted:
+                return f"Error: knowledge base {knowledge_base_id} not found."
+
+        from app.services.upload_signing import UPLOAD_URL_TTL_SECONDS, sign_upload
+
+        upload_id = _uuid.uuid4().hex
+        expires = int(time.time()) + UPLOAD_URL_TTL_SECONDS
+        signature = sign_upload(upload_id, str(kb_uuid), filename, expires)
+
+        base_url = (settings.MCP_PUBLIC_BASE_URL or "").rstrip("/")
+        query = urlencode(
+            {"kb_id": str(kb_uuid), "filename": filename, "expires": expires, "sig": signature}
+        )
+        url = f"{base_url}/api/v1/uploads/{upload_id}?{query}"
+
+        return (
+            f"Upload URL (valid {UPLOAD_URL_TTL_SECONDS // 60} min, single use, "
+            f"max {settings.MAX_FILE_SIZE_MB}MB):\n{url}\n\n"
+            f"curl -X PUT -T '{filename}' '{url}'"
+        )
+
+    @mcp.tool()
+    async def delete_document(document_id: str) -> str:
+        """Soft-delete a document and remove its vectors."""
+        disabled = await _ensure_tool_enabled("delete_document")
+        if disabled:
+            return disabled
+
+        try:
+            doc_uuid = UUID(str(document_id))
+        except Exception:
+            return "Error: invalid document_id."
+
+        from app.api.v1.documents import delete_document as _api_delete_document
+
+        async with get_db_session() as db:
+            try:
+                await _api_delete_document(doc_id=doc_uuid, db=db, user_id=None)
+            except HTTPException as exc:
+                return f"Error: {exc.detail}"
+
+        return f"Deleted document {document_id}."
+
+    return mcp
+
+
+def get_mcp_app():
+    mcp = build_mcp_app()
+    # Use root path so mounting at /mcp exposes /mcp (not /mcp/mcp).
+    return mcp.http_app(path="/", stateless_http=True, json_response=True)

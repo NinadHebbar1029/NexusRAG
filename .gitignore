@@ -1,0 +1,209 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+.pybuilder/
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# poetry
+poetry.lock
+
+# pdm
+.pdm.toml
+
+# PEP 582
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.env.local
+.env.*.local
+.env.production
+.env.production.temp
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Project specific
+data/
+temp/
+tmp/
+logs/
+*.db
+docs/
+docs/MCP_SECURITY_TEST_PLAN.local.md
+examples/
+scripts/*
+!scripts/backup.sh
+!scripts/restore.sh
+!scripts/migrate_dev_to_prod.sh
+!scripts/fix_enum_case.sh
+!scripts/deploy_backend.sh
+!scripts/deploy_frontend.sh
+!scripts/check.sh
+!scripts/check_mcp_smoke.sh
+!scripts/README.md
+frontend/_local/
+screenshots/
+chat*.png
+!/chat_settings.png
+
+# Local secrets / private docs (root)
+/*.md
+!/README.md
+!/RUNBOOK.md
+!/DEVELOPMENT_LOG.md
+!/MIGRATION_GUIDE.md
+!/DEPLOY.md
+/RUNBOOK_LOCAL.md
+/antropic_key.txt
+/voyageai_key.txt
+/MobaXterm_NAS_20260125_195638.rtf
+
+# Root-level test artifacts (PDFs, screenshots, ebook samples, ad-hoc output)
+/[0-9][0-9].png
+/*.pdf
+/*.fb2
+/output/
+
+# Alembic
+alembic/versions/*.pyc
+
+# Local deployment and runbook files with private data
+*_LOCAL.md
+
+# Local test files and service information
+test_document_ai_history.txt
+test_semantic_chunking.py
+test_semantic_chunking_integration.py
+test_texts.py
+check_documents.py
+# Local secrets and uploads
+secrets/
+uploads/
+
+# Database backups (pg_dump output)
+backups/
+
+# Private local agent/testing docs
+AGENTS.local.md
+TESTING.local.md
